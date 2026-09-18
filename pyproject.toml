@@ -1,0 +1,18 @@
+[project]
+name = "trace_point"
+version = "0.1.0"
+description = "macOS-style Spotlight Search Bar for Niri / Wayland"
+requires-python = ">=3.10"
+dependencies = [
+    "PyGObject",
+]
+
+[project.scripts]
+trace_point = "trace_point.main:main"
+
+[tool.setuptools.package-data]
+trace_point = ["icons/*.svg"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
