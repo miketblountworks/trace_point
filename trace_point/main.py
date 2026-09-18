@@ -19,7 +19,7 @@ import math
 import urllib.request
 import urllib.parse
 
-SOCKET_PATH = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "spotlight.sock")
+SOCKET_PATH = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "trace_point.sock")
 
 def client_command(cmd="toggle"):
     if not os.path.exists(SOCKET_PATH):
