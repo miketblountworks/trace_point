@@ -1,7 +1,7 @@
 [project]
 name = "trace_point"
 version = "0.1.0"
-description = "macOS-style Spotlight Search Bar for Niri / Wayland"
+description = "macOS-style TracePoint Search Bar for Niri / Wayland"
 requires-python = ">=3.10"
 dependencies = [
     "PyGObject",
