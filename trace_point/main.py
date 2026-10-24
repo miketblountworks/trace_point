@@ -142,6 +142,95 @@ def spawn_detached(cmd, *, shell=False, env=None):
             return None
 
 
+_WORD_START_RE = re.compile(r"[\s\-_.()/]")
+
+
+def match_quality(query, text):
+    """How well a lowercase query matches lowercase text.
+
+    5 exact, 4 prefix, 3 start of a later word, 2 anywhere, 1..2 the
+    letters appear in order ("ffox" in "firefox"; tighter spans score
+    closer to 2), None for no match.
+    """
+    if not query or not text:
+        return None
+    if text == query:
+        return 5
+    if text.startswith(query):
+        return 4
+    pos = text.find(query)
+    if pos > 0:
+        while pos > 0:
+            if _WORD_START_RE.match(text[pos - 1]):
+                return 3
+            pos = text.find(query, pos + 1)
+        return 2
+    if len(query) < 2:
+        return None
+    first = idx = text.find(query[0])
+    if idx < 0:
+        return None
+    for ch in query[1:]:
+        idx = text.find(ch, idx + 1)
+        if idx < 0:
+            return None
+    tightness = len(query) / (idx - first + 1)
+    # Letters spread across the whole name ("fire" in "file roller") are noise.
+    if tightness < 0.5:
+        return None
+    return 1 + tightness
+
+
+def scaled_score(quality, scores, fuzzy_lo, fuzzy_hi):
+    """Map a match_quality to a source's score scale.
+
+    scores maps the whole-number qualities 2..5; letters-in-order matches land
+    between fuzzy_lo and fuzzy_hi.
+    """
+    if quality is None:
+        return None
+    if quality < 2:
+        return fuzzy_lo + (fuzzy_hi - fuzzy_lo) * (quality - 1)
+    return scores[int(quality)]
+
+
+def current_compositor():
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return "hyprland"
+    if os.environ.get("NIRI_SOCKET"):
+        return "niri"
+    return None
+
+
+def hyprland_dispatch(lua_expr, legacy_args):
+    """Run a Hyprland dispatcher on Lua (0.55+) or classic configs.
+
+    A Lua config rejects the classic form and a classic config rejects the
+    Lua form, so try one and fall back to the other.
+    """
+    for args in ([lua_expr], legacy_args):
+        try:
+            res = subprocess.run(
+                ["hyprctl", "dispatch", *args],
+                capture_output=True, text=True, timeout=2,
+            )
+        except Exception:
+            return False
+        if res.returncode == 0 and res.stdout.strip() == "ok":
+            return True
+    return False
+
+
+def log_out():
+    compositor = current_compositor()
+    if compositor == "hyprland":
+        hyprland_dispatch("hl.dsp.exit()", ["exit"])
+    elif compositor == "niri":
+        spawn_detached(["niri", "msg", "action", "quit"])
+    elif os.environ.get("XDG_SESSION_ID"):
+        spawn_detached(["loginctl", "terminate-session", os.environ["XDG_SESSION_ID"]])
+
+
 _PKG_NAME_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
 _APP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -1488,8 +1577,9 @@ class SpotlightWindow:
         self.current_instant_results = []
         self.search_generation = 0
         self.debounce_timer_id = None
-        self.proc_lock = threading.Lock()
-        self.active_processes = []
+        self.file_index = []
+        self.file_index_time = 0.0
+        self.file_index_building = False
 
         # Unified spring + rubber-band scroller (fling, wheel, keyboard)
         self.spring_scroller = SpringScroller(
@@ -1528,6 +1618,7 @@ class SpotlightWindow:
         self.create_window()
         self.apps_dirs_mtimes = {}
         self.load_applications_cache()
+        self.refresh_file_index()
 
     def setup_css(self):
         settings = Gtk.Settings.get_default()
@@ -2184,6 +2275,8 @@ class SpotlightWindow:
     def parse_desktop_file(self, path):
         name = None
         comment = ""
+        generic_name = ""
+        keywords = []
         icon = "application-x-executable"
         exec_cmd = ""
         nodisplay = False
@@ -2207,6 +2300,10 @@ class SpotlightWindow:
                         name = v
                     elif k == "Comment":
                         comment = v
+                    elif k == "GenericName":
+                        generic_name = v
+                    elif k == "Keywords":
+                        keywords = [w.strip() for w in v.split(";") if w.strip()]
                     elif k == "Icon":
                         icon = v
                     elif k == "Exec":
@@ -2222,6 +2319,8 @@ class SpotlightWindow:
                     "type": "app",
                     "name": name,
                     "comment": comment,
+                    "generic_name": generic_name,
+                    "keywords": keywords,
                     "icon": icon,
                     "exec": exec_cmd,
                     "path": path,
@@ -2230,16 +2329,6 @@ class SpotlightWindow:
         except Exception:
             pass
         return None
-
-    def cancel_active_searches(self):
-        with self.proc_lock:
-            for p in self.active_processes:
-                try:
-                    if p.poll() is None:
-                        p.terminate()
-                except Exception:
-                    pass
-            self.active_processes.clear()
 
     @staticmethod
     def get_file_icon(path, is_dir):
@@ -2381,11 +2470,10 @@ class SpotlightWindow:
         gen = self.search_generation
         self._schedule_surface_repaint()
 
-        # Cancel any pending debounce timer & previous search processes
+        # Cancel any pending debounce timer
         if self.debounce_timer_id is not None:
             GLib.source_remove(self.debounce_timer_id)
             self.debounce_timer_id = None
-        self.cancel_active_searches()
 
         if not raw_text:
             if self.current_filter == "all":
@@ -2486,51 +2574,54 @@ class SpotlightWindow:
     def get_app_results(self, query):
         results = []
         for app in self.apps:
-            name_lower = app["name"].lower()
-            comm_lower = app["comment"].lower()
-            if not query or query in name_lower or query in comm_lower:
-                score = 0
-                if query:
-                    if name_lower == query:
-                        score = 50
-                    elif name_lower.startswith(query):
-                        score = 35
-                    elif query in name_lower:
-                        score = 20
-                    elif query in comm_lower:
-                        score = 10
-                results.append((score, {
-                    "category": "Application",
-                    "title": app["name"],
-                    "subtitle": app["comment"] or "Application",
-                    "icon": app["icon"],
-                    "desktop_path": app.get("path"),
-                    "action": lambda a=app: self.launch_app(a)
-                }))
+            score = 0
+            if query:
+                candidates = [
+                    scaled_score(match_quality(query, app["name"].lower()), {5: 50, 4: 35, 3: 28, 2: 20}, 8, 16),
+                    10 if query in app["comment"].lower() else None,
+                ]
+                # Generic names and keywords ("browser" → Firefox), whole pieces only:
+                # letters-in-order matches against keyword lists are mostly noise.
+                for extra in [app.get("generic_name", "")] + app.get("keywords", []):
+                    quality = match_quality(query, extra.lower())
+                    if quality is not None and quality >= 2:
+                        candidates.append({5: 24, 4: 22, 3: 18, 2: 14}[int(quality)])
+                candidates = [c for c in candidates if c is not None]
+                if not candidates:
+                    continue
+                score = max(candidates)
+            results.append((score, {
+                "category": "Application",
+                "title": app["name"],
+                "subtitle": app["comment"] or "Application",
+                "icon": app["icon"],
+                "desktop_path": app.get("path"),
+                "action": lambda a=app: self.launch_app(a)
+            }))
         return results
 
     def get_window_results(self, query):
         windows = self.get_open_windows()
         results = []
         for win in windows:
-            t_lower = win["title"].lower()
-            a_lower = win["app"].lower()
-            if not query or query in t_lower or query in a_lower:
-                score = 30 if query else 10
-                if query:
-                    if t_lower == query or a_lower == query:
-                        score = 52
-                    elif t_lower.startswith(query):
-                        score = 42
-                    elif query in t_lower:
-                        score = 32
-                results.append((score, {
-                    "category": "Window",
-                    "title": win["title"],
-                    "subtitle": win["app"],
-                    "icon": win["app"].lower(),
-                    "action": lambda w=win: self.focus_window(w)
-                }))
+            score = 10
+            if query:
+                app_quality = match_quality(query, win["app"].lower())
+                candidates = [
+                    scaled_score(match_quality(query, win["title"].lower()), {5: 52, 4: 42, 3: 36, 2: 32}, 10, 18),
+                    (52 if app_quality == 5 else 30) if app_quality is not None and app_quality >= 2 else None,
+                ]
+                candidates = [c for c in candidates if c is not None]
+                if not candidates:
+                    continue
+                score = max(candidates)
+            results.append((score, {
+                "category": "Window",
+                "title": win["title"],
+                "subtitle": win["app"],
+                "icon": win["app"].lower(),
+                "action": lambda w=win: self.focus_window(w)
+            }))
 
         # Quick System Actions
         system_actions = [
@@ -2540,7 +2631,7 @@ class SpotlightWindow:
             ("Sleep / Suspend", "Put computer into low power suspend mode", "system-suspend", lambda: spawn_detached(["systemctl", "suspend"])),
             ("Restart", "Reboot the computer", "system-reboot", lambda: spawn_detached(["systemctl", "reboot"])),
             ("Shut Down", "Power off the computer", "system-shutdown", lambda: spawn_detached(["systemctl", "poweroff"])),
-            ("Log Out", "Exit current desktop session", "system-log-out", lambda: spawn_detached(["niri", "msg", "action", "quit"])),
+            ("Log Out", "Exit current desktop session", "system-log-out", log_out),
         ]
 
         for act_title, act_sub, act_icon, act_fn in system_actions:
@@ -2585,16 +2676,8 @@ class SpotlightWindow:
             title_text = os.path.basename(path)
             if not title_text:
                 title_text = path
-            base = title_text.lower()
-            score = 8
-            if base == query:
-                score = 48
-            elif base.startswith(query):
-                score = 28
-            elif query in base:
-                score = 15
 
-            file_results.append((score, {
+            file_results.append((item["score"], {
                 "category": "Folder" if is_dir else "Document",
                 "title": title_text,
                 "subtitle": path.replace(os.path.expanduser("~"), "~"),
@@ -2821,102 +2904,119 @@ class SpotlightWindow:
                 GLib.timeout_add(delay, reveal_row)
 
     def get_open_windows(self):
+        compositor = current_compositor()
         try:
-            out = subprocess.check_output(["niri", "msg", "-j", "windows"], text=True)
-            data = json.loads(out)
-            wins = []
-            for w in data:
-                wins.append({
-                    "id": w.get("id"),
-                    "title": w.get("title") or "Window",
-                    "app": w.get("app_id") or "Application"
-                })
-            return wins
+            if compositor == "hyprland":
+                out = subprocess.check_output(["hyprctl", "clients", "-j"], text=True, timeout=1)
+                return [
+                    {
+                        "id": w.get("address"),
+                        "title": w.get("title") or "Window",
+                        "app": w.get("class") or w.get("initialClass") or "Application",
+                    }
+                    for w in json.loads(out)
+                    if w.get("mapped", True) and not w.get("hidden", False)
+                ]
+            if compositor == "niri":
+                out = subprocess.check_output(["niri", "msg", "-j", "windows"], text=True, timeout=1)
+                return [
+                    {
+                        "id": w.get("id"),
+                        "title": w.get("title") or "Window",
+                        "app": w.get("app_id") or "Application",
+                    }
+                    for w in json.loads(out)
+                ]
         except Exception:
-            return []
+            pass
+        return []
 
     def focus_window(self, win):
+        compositor = current_compositor()
         try:
-            subprocess.run(["niri", "msg", "action", "focus-window", "--id", str(win["id"])])
+            if compositor == "hyprland":
+                address = win["id"]
+                hyprland_dispatch(
+                    f'hl.dsp.focus({{ window = "address:{address}" }})',
+                    ["focuswindow", f"address:{address}"],
+                )
+            elif compositor == "niri":
+                subprocess.run(["niri", "msg", "action", "focus-window", "--id", str(win["id"])])
         except Exception:
             pass
         self.hide()
 
+    FILE_INDEX_MAX_AGE = 60.0
+    FILE_INDEX_EXCLUDES = (
+        ".git", "node_modules", ".cache", ".var", ".gradle", "snap", ".local",
+        "Android", "google-chrome", "chromium", "__pycache__", ".cargo",
+        ".rustup", ".gemini", ".codex", ".grok", "target",
+    )
+
+    def refresh_file_index(self):
+        """Rebuild the in-memory list of files and folders in the background.
+
+        Listing home with fd takes tens of milliseconds, so searches filter
+        this list instead of starting fd on every keystroke.
+        """
+        if self.file_index_building:
+            return
+        self.file_index_building = True
+
+        def worker():
+            home = os.path.expanduser("~")
+            roots = [home, os.path.join(home, ".config")]
+            excludes = []
+            for name in self.FILE_INDEX_EXCLUDES:
+                excludes += ["--exclude", name]
+            entries = []
+            seen = set()
+            try:
+                for kind, is_dir in (("d", True), ("f", False)):
+                    out = subprocess.run(
+                        ["fd", "-t", kind, "--absolute-path", *excludes, ".", *roots],
+                        capture_output=True, text=True, timeout=10,
+                    ).stdout
+                    for line in out.splitlines():
+                        path = line.rstrip("/")
+                        if not path or path in seen:
+                            continue
+                        seen.add(path)
+                        rel = path[len(home) + 1:] if path.startswith(home + "/") else path
+                        entries.append((path, os.path.basename(path).lower(), rel.lower(), is_dir))
+            except Exception:
+                entries = None
+            GLib.idle_add(self._finish_file_index, entries)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_file_index(self, entries):
+        self.file_index_building = False
+        if entries is not None:
+            self.file_index = entries
+            self.file_index_time = time.monotonic()
+        return False
+
     def search_files(self, query, folders_only=False, documents_only=False, gen=None):
         if not query:
             return []
-        items = []
-        home = os.path.expanduser("~")
-        cfg = os.path.join(home, ".config")
-        find_type = ["-t", "d"] if folders_only else (["-t", "f"] if documents_only else ["-t", "f", "-t", "d"])
-        exclusions = [
-            "--exclude", ".git",
-            "--exclude", "node_modules",
-            "--exclude", ".cache",
-            "--exclude", ".var",
-            "--exclude", ".gradle",
-            "--exclude", "snap",
-            "--exclude", ".local",
-            "--exclude", "Android",
-            "--exclude", "google-chrome",
-            "--exclude", "chromium",
-            "--exclude", "__pycache__",
-            "--exclude", ".cargo",
-            "--exclude", ".rustup",
-            "--exclude", ".gemini",
-            "--exclude", ".codex",
-            "--exclude", ".grok",
-            "--exclude", "target",
-        ]
-        cmd_find = ["fd"] + find_type + exclusions + [".", home, cfg]
-        cmd_fzf = ["fzf", "--filter", query]
-
-        try:
-            p_find = subprocess.Popen(
-                cmd_find,
-                cwd=home,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True
-            )
-            p_fzf = subprocess.Popen(
-                cmd_fzf,
-                stdin=p_find.stdout,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True
-            )
-            p_find.stdout.close()
-
-            with self.proc_lock:
-                self.active_processes.extend([p_find, p_fzf])
-
-            try:
-                out, _ = p_fzf.communicate(timeout=0.8)
-            except subprocess.TimeoutExpired:
-                p_find.kill()
-                p_fzf.kill()
-                out, _ = p_fzf.communicate()
-            finally:
-                with self.proc_lock:
-                    if p_find in self.active_processes:
-                        self.active_processes.remove(p_find)
-                    if p_fzf in self.active_processes:
-                        self.active_processes.remove(p_fzf)
-
+        matches = []
+        for path, base, rel, is_dir in self.file_index:
+            if (folders_only and not is_dir) or (documents_only and is_dir):
+                continue
+            score = scaled_score(match_quality(query, base), {5: 48, 4: 28, 3: 22, 2: 15}, 5, 10)
+            if score is None:
+                if query not in rel:
+                    continue
+                score = 6
+            matches.append((score, -len(rel), path, is_dir))
             if gen is not None and gen != self.search_generation:
                 return []
-
-            lines = [l.strip().rstrip("/") for l in out.strip().split("\n") if l.strip()][:15]
-            for l in lines:
-                full_path = l if os.path.isabs(l) else os.path.join(home, l)
-                items.append({
-                    "path": full_path,
-                    "is_dir": os.path.isdir(full_path)
-                })
-        except Exception:
-            pass
-        return items
+        matches.sort(reverse=True)
+        return [
+            {"path": path, "is_dir": is_dir, "score": score}
+            for score, _, path, is_dir in matches[:15]
+        ]
 
     def launch_app(self, app):
         cmd = app["exec"]
@@ -3104,6 +3204,8 @@ class SpotlightWindow:
 
     def show(self):
         self.check_and_reload_applications()
+        if time.monotonic() - self.file_index_time > self.FILE_INDEX_MAX_AGE:
+            self.refresh_file_index()
         self.search_generation += 1
         self.row_anim_generation += 1
         if self.debounce_timer_id is not None:
@@ -3112,7 +3214,6 @@ class SpotlightWindow:
         if self._buttons_reveal_timer is not None:
             GLib.source_remove(self._buttons_reveal_timer)
             self._buttons_reveal_timer = None
-        self.cancel_active_searches()
         self.fling_scroller.stop_fling()
         self.smooth_scroller.stop()
         self.entry.set_text("")
@@ -3160,7 +3261,6 @@ class SpotlightWindow:
         if self._buttons_reveal_timer is not None:
             GLib.source_remove(self._buttons_reveal_timer)
             self._buttons_reveal_timer = None
-        self.cancel_active_searches()
         self.fling_scroller.stop_fling()
         self.smooth_scroller.stop()
         # Collapse panels first so close feels like Spotlight packing away
