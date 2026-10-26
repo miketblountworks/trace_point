@@ -351,79 +351,290 @@ def _die_with_parent():
 
 
 class ClipboardHistory:
-    """Recent clipboard contents, kept in the session's runtime folder.
+    """What you copied: recent copies in the session's runtime folder, starred ones at home.
 
-    wl-paste --watch writes each new copy to its own file. The folder lives
-    in XDG_RUNTIME_DIR (memory, cleared at logout), and copies a password
-    manager marks as sensitive are skipped.
+    wl-paste --watch saves each copy in the type it was offered (a picture as a
+    picture, copied files as a file list, else text) with a ".type" note beside
+    it and, when Hyprland says, the app it came from (".src"). Recent copies
+    live in XDG_RUNTIME_DIR (memory, cleared at logout); starring one copies it
+    to ~/.local/share/trace_point/clipboard-starred, where it stays until it's
+    unstarred. Copies a password manager marks as sensitive are never saved.
+    With tesseract installed, the words in pictures are read once (".txt") so
+    screenshots can be found by what they show.
     """
 
-    MAX_ITEMS = 50
-    MAX_AGE = 8 * 3600
-    _IMAGE_MAGIC = (b"\x89PNG", b"\xff\xd8\xff", b"GIF8", b"RIFF")
+    MAX_ITEMS = 200
+    MAX_AGE = 24 * 3600
+    _IMAGE_MAGIC = {b"\x89PNG": "image/png", b"\xff\xd8\xff": "image/jpeg", b"GIF8": "image/gif", b"RIFF": "image/webp"}
+    _IMAGE_TYPES = ("image/png", "image/jpeg", "image/webp", "image/gif")
+    _SIDECARS = (".type", ".src", ".shot", ".txt")
+    # Apps whose copied pictures are screenshots (Print opens swappy here).
+    SCREENSHOT_APPS = {"swappy", "satty", "flameshot", "ksnip", "org.ksnip.ksnip", "gradia", "be.alexandervanhee.gradia"}
+    _LINK_RE = re.compile(r"^(?:https?://|www\.)\S+$", re.I)
+    _COLOR_RE = re.compile(r"^(?:#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})|(?:rgba?|hsla?)\([^()]{3,40}\))$", re.I)
+    # Terminals paste with Ctrl+Shift+V.
+    _TERMINALS = "kitty|foot|footclient|Alacritty|org.wezfurlong.wezterm|com.mitchellh.ghostty|konsole|org.kde.konsole|org.gnome.Ptyxis|org.gnome.Console|xterm"
+
+    _WATCH_SCRIPT = r"""
+d="$1"
+[ "${CLIPBOARD_STATE:-data}" = data ] || { cat > /dev/null; exit 0; }
+n="$d/$(date +%s%N)"
+cat > "$n.part"
+t=text/plain
+types=$(wl-paste --list-types 2>/dev/null)
+for want in text/uri-list image/png image/jpeg image/webp image/gif; do
+  printf '%s\n' "$types" | grep -qx "$want" || continue
+  if [ "$want" = text/uri-list ]; then
+    wl-paste --type text/uri-list 2>/dev/null | grep -q '^file://' || continue
+  fi
+  wl-paste --type "$want" > "$n.part" 2>/dev/null && t=$want
+  break
+done
+src=$(hyprctl activewindow -j 2>/dev/null | sed -n 's/^ *"class": "\(.*\)",$/\1/p' | head -n 1)
+printf %s "$t" > "$n.type"
+[ -n "$src" ] && printf %s "$src" > "$n.src"
+if [ -e "$d/.shot-next" ] && [ "$t" != text/plain ]; then rm -f "$d/.shot-next"; : > "$n.shot"; fi
+mv "$n.part" "$n"
+"""
 
     def __init__(self):
         self.dir = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "trace_point-clipboard")
+        self.star_dir = os.path.join(
+            os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "trace_point", "clipboard-starred"
+        )
         self.proc = None
+        self._meta = {}
+        self._ocr_tried = set()
+        self._ocr_running = False
 
     def start(self):
         if not shutil.which("wl-paste"):
             return
         try:
             os.makedirs(self.dir, mode=0o700, exist_ok=True)
-            script = (
-                'if [ "${CLIPBOARD_STATE:-data}" = data ]; '
-                'then cat > "$1/$(date +%s%N)"; else cat > /dev/null; fi'
-            )
             self.proc = subprocess.Popen(
-                ["wl-paste", "--watch", "sh", "-c", script, "sh", self.dir],
+                ["wl-paste", "--watch", "sh", "-c", self._WATCH_SCRIPT, "sh", self.dir],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 env=_child_env(), preexec_fn=_die_with_parent,
             )
         except Exception:
             self.proc = None
 
-    def entries(self):
-        """Newest first: {path, kind ("text"|"image"), text, time}."""
+    def mark_next_as_screenshot(self):
+        """The next picture copied is a screenshot (for our own screenshot action)."""
         try:
-            names = sorted(os.listdir(self.dir), reverse=True)
-        except OSError:
-            return []
-        now = time.time()
-        out, seen = [], set()
-        for name in names:
-            path = os.path.join(self.dir, name)
-            try:
-                stamp = int(name) / 1e9
-                with open(path, "rb") as f:
-                    data = f.read()
-            except (ValueError, OSError):
-                continue
-            digest = hashlib.sha1(data).digest()
-            if not data.strip() or digest in seen or len(out) >= self.MAX_ITEMS or now - stamp > self.MAX_AGE:
-                self.forget(path)
-                continue
-            seen.add(digest)
-            if data.startswith(self._IMAGE_MAGIC):
-                out.append({"path": path, "kind": "image", "text": "Image", "time": stamp})
-                continue
-            try:
-                text = data.decode("utf-8")
-            except UnicodeDecodeError:
-                continue
-            out.append({"path": path, "kind": "text", "text": text, "time": stamp})
-        return out
-
-    def forget(self, path):
-        try:
-            os.unlink(path)
+            open(os.path.join(self.dir, ".shot-next"), "w").close()
         except OSError:
             pass
 
     @staticmethod
+    def _names(folder):
+        try:
+            return [n for n in os.listdir(folder) if n.isdigit()]
+        except OSError:
+            return []
+
+    @staticmethod
+    def _sidecar(path, suffix):
+        try:
+            with open(path + suffix, encoding="utf-8", errors="replace") as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    def entries(self):
+        """Starred copies first, then the rest, each newest first, one per distinct copy.
+
+        Each is a dict: path, kind ("image"|"files"|"link"|"color"|"text"), mime,
+        title, text, time, starred, src, screenshot, size, dims, paths, search.
+        """
+        now = time.time()
+        out, seen = [], set()
+        for starred, folder in ((True, self.star_dir), (False, self.dir)):
+            kept = 0
+            for name in sorted(self._names(folder), reverse=True):
+                path = os.path.join(folder, name)
+                stamp = int(name) / 1e9
+                if not starred and (kept >= self.MAX_ITEMS or now - stamp > self.MAX_AGE):
+                    self.forget(path)
+                    continue
+                entry = self._read(path, stamp)
+                if entry is None or entry["digest"] in seen:
+                    if not starred:
+                        self.forget(path)
+                    continue
+                seen.add(entry["digest"])
+                entry["starred"] = starred
+                out.append(entry)
+                kept += 1
+        self._read_words_later(out)
+        return out
+
+    def _read(self, path, stamp):
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        key = (st.st_mtime_ns, st.st_size)
+        cached = self._meta.get(path)
+        if cached is None or cached[0] != key:
+            info = self._describe(path, st.st_size)
+            if info is None:
+                return None
+            self._meta[path] = cached = (key, info)
+        entry = dict(cached[1], path=path, time=stamp)
+        words = self._sidecar(path, ".txt") if entry["kind"] == "image" else None
+        entry["words"] = words or ""
+        entry["search"] = " ".join(
+            (entry["title"], entry["text"], entry["src"], entry["words"], "screenshot" if entry["screenshot"] else "")
+        ).lower()
+        return entry
+
+    def _describe(self, path, size):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return None
+        if not data.strip():
+            return None
+        mime = self._sidecar(path, ".type") or ""
+        if not mime:
+            mime = next((m for magic, m in self._IMAGE_MAGIC.items() if data.startswith(magic)), "text/plain")
+        src = self._sidecar(path, ".src") or ""
+        info = {"digest": hashlib.sha1(data).digest(), "size": size, "src": src, "mime": mime,
+                "screenshot": False, "paths": [], "dims": None}
+        if mime in self._IMAGE_TYPES:
+            try:
+                _fmt, width, height = GdkPixbuf.Pixbuf.get_file_info(path)
+                info["dims"] = (width, height) if width > 0 else None
+            except Exception:
+                pass
+            shot = os.path.exists(path + ".shot") or src.lower() in self.SCREENSHOT_APPS
+            label = "Screenshot" if shot else "Image"
+            dims = f" {info['dims'][0]} × {info['dims'][1]}" if info["dims"] else ""
+            info.update(kind="image", screenshot=shot, title=label + dims, text="")
+            return info
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        if mime == "text/uri-list":
+            paths = [urllib.parse.unquote(urllib.parse.urlparse(line.strip()).path)
+                     for line in text.splitlines() if line.strip().startswith("file://")]
+            if paths:
+                names = [os.path.basename(p.rstrip("/")) or p for p in paths]
+                title = names[0] if len(names) == 1 else f"{len(names)} files: " + ", ".join(names[:3]) + ("…" if len(names) > 3 else "")
+                info.update(kind="files", paths=paths, title=title, text="\n".join(paths))
+                return info
+            mime = info["mime"] = "text/plain"
+        one = text.strip()
+        if "\n" not in one and self._LINK_RE.match(one):
+            kind = "link"
+        elif self._COLOR_RE.match(one):
+            kind = "color"
+        else:
+            kind = "text"
+        lines = one.splitlines() or [""]
+        info.update(kind=kind, title=lines[0].strip()[:160], text=text)
+        return info
+
+    def _read_words_later(self, entries):
+        """Read the words in pictures in the background, one at a time (needs tesseract)."""
+        if self._ocr_running or not shutil.which("tesseract"):
+            return
+        todo = [e["path"] for e in entries
+                if e["kind"] == "image" and e["path"] not in self._ocr_tried and not os.path.exists(e["path"] + ".txt")]
+        if not todo:
+            return
+        self._ocr_tried.update(todo)
+        self._ocr_running = True
+
+        def worker():
+            try:
+                for path in todo:
+                    try:
+                        done = subprocess.run(["tesseract", path, "-"], capture_output=True, timeout=60, env=_child_env())
+                        words = " ".join(done.stdout.decode("utf-8", errors="replace").split())
+                    except Exception:
+                        continue
+                    try:
+                        with open(path + ".txt", "w", encoding="utf-8") as f:
+                            f.write(words)
+                    except OSError:
+                        pass
+            finally:
+                self._ocr_running = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def forget(self, path):
+        for suffix in self._SIDECARS + ("",):
+            try:
+                os.unlink(path + suffix)
+            except OSError:
+                pass
+        self._meta.pop(path, None)
+
+    def star(self, entry):
+        """Keep it at home, past logout, until it's unstarred."""
+        try:
+            os.makedirs(self.star_dir, mode=0o700, exist_ok=True)
+            target = os.path.join(self.star_dir, os.path.basename(entry["path"]))
+            for suffix in self._SIDECARS + ("",):
+                if os.path.exists(entry["path"] + suffix):
+                    shutil.copy2(entry["path"] + suffix, target + suffix)
+        except OSError:
+            pass
+
+    def unstar(self, entry):
+        """Back to the recent copies, where it ages out like the rest."""
+        target = os.path.join(self.dir, os.path.basename(entry["path"]))
+        try:
+            os.makedirs(self.dir, mode=0o700, exist_ok=True)
+            if not os.path.exists(target):
+                for suffix in self._SIDECARS + ("",):
+                    if os.path.exists(entry["path"] + suffix):
+                        shutil.copy2(entry["path"] + suffix, target + suffix)
+        except OSError:
+            return
+        self.forget(entry["path"])
+
+    @staticmethod
+    def _copy_command(entry):
+        mime = entry.get("mime") or "text/plain"
+        if mime == "text/plain":
+            return 'wl-copy < "$1"'
+        return f'wl-copy --type {shlex.quote(mime)} < "$1"'
+
+    @staticmethod
     def copy(entry):
-        cmd = 'wl-copy < "$1"' if entry["kind"] == "text" else 'wl-copy --type image/png < "$1"'
-        spawn_detached(["sh", "-c", cmd, "sh", entry["path"]])
+        spawn_detached(["sh", "-c", ClipboardHistory._copy_command(entry), "sh", entry["path"]])
+
+    @staticmethod
+    def paste(entry):
+        """Copy it, then press paste in the window that gets the keyboard back (needs wtype)."""
+        script = (
+            ClipboardHistory._copy_command(entry) + "; sleep 0.3; "
+            'c=$(hyprctl activewindow -j 2>/dev/null | sed -n \'s/^ *"class": "\\(.*\\)",$/\\1/p\' | head -n 1); '
+            f'case "$c" in {ClipboardHistory._TERMINALS}) wtype -M ctrl -M shift -k v -m shift -m ctrl ;; '
+            '*) wtype -M ctrl -k v -m ctrl ;; esac'
+        )
+        spawn_detached(["sh", "-c", script, "sh", entry["path"]])
+
+    def save_copy(self, entry):
+        """Save it as a file in ~/Downloads; returns the new path."""
+        folder = os.path.join(os.path.expanduser("~"), "Downloads")
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(entry["time"]))
+        ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}.get(entry["mime"], ".txt")
+        base = "Screenshot" if entry.get("screenshot") else "Clipboard"
+        target = os.path.join(folder, f"{base}_{stamp}{ext}")
+        try:
+            os.makedirs(folder, exist_ok=True)
+            shutil.copyfile(entry["path"], target)
+        except OSError:
+            return None
+        return target
 
 
 QUICK_KEYS_PATH = os.path.join(
@@ -1228,6 +1439,32 @@ button.clip-card:hover {
     background-color: rgba(255, 255, 255, 0.20);
 }
 
+/* ── Clipboard history ── */
+.clip-kinds {
+    padding: 2px 6px 6px 6px;
+}
+
+button.clip-kind {
+    background-color: rgba(255, 255, 255, 0.07);
+    border: none;
+    box-shadow: none;
+    border-radius: 9999px;
+    padding: 4px 12px;
+    min-height: 0;
+    color: rgba(255, 255, 255, 0.80);
+    font-size: 12px;
+}
+
+button.clip-kind.active {
+    background-color: rgba(255, 255, 255, 0.22);
+    color: #ffffff;
+    font-weight: 600;
+}
+
+.clip-thumb {
+    border-radius: 8px;
+}
+
 /* ── Last few copies, as cards ── */
 .clip-strip {
     padding: 0 6px 6px 6px;
@@ -1985,6 +2222,8 @@ class SpotlightWindow:
         self.preview_item = None
         self.quick_keys = load_quick_keys()
         self.clipboard = ClipboardHistory()
+        self.clip_kind = "all"
+        self.thumb_cache = {}
 
         # Unified spring + rubber-band scroller (fling, wheel, keyboard)
         self.spring_scroller = SpringScroller(
@@ -2306,8 +2545,10 @@ class SpotlightWindow:
 
         grid = Gtk.Grid(column_spacing=12, row_spacing=4)
         self.preview_kind, self.preview_size, self.preview_changed = Gtk.Label(), Gtk.Label(), Gtk.Label()
+        self.preview_keys = []
         for row, (name, value) in enumerate((("Kind", self.preview_kind), ("Size", self.preview_size), ("Changed", self.preview_changed))):
             key = Gtk.Label(label=name)
+            self.preview_keys.append(key)
             key.add_css_class("preview-key")
             key.set_xalign(0)
             value.add_css_class("preview-value")
@@ -2317,7 +2558,7 @@ class SpotlightWindow:
             grid.attach(value, 1, row, 1, 1)
         self.preview_box.append(grid)
 
-        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        buttons = self.preview_file_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         for label, fn in (
             ("Open", lambda: self.open_file(self.preview_item["path"])),
             ("Show in folder", lambda: self.show_in_folder(self.preview_item["path"])),
@@ -2329,6 +2570,27 @@ class SpotlightWindow:
             button.connect("clicked", lambda _b, f=fn: self.preview_item and f())
             buttons.append(button)
         self.preview_box.append(buttons)
+
+        clip = lambda: self.preview_item["clip"]
+        self.preview_clip_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.preview_star_button = None
+        for label, fn in (
+            ("Copy", lambda: (ClipboardHistory.copy(clip()), self.hide())),
+            ("Paste here", lambda: self.paste_clip(clip())),
+            ("Star", lambda: self.toggle_star(clip())),
+            ("Save", lambda: self.save_clip(clip())),
+        ):
+            button = Gtk.Button(label=label)
+            button.add_css_class("preview-btn")
+            button.set_can_focus(False)
+            button.connect("clicked", lambda _b, f=fn: self.preview_item and self.preview_item.get("kind") == "clip" and f())
+            self.preview_clip_buttons.append(button)
+            if label == "Star":
+                self.preview_star_button = button
+            elif label == "Save":
+                self.preview_save_button = button
+        self.preview_clip_buttons.set_visible(False)
+        self.preview_box.append(self.preview_clip_buttons)
         return self.preview_box
 
     def _setup_blur(self):
@@ -2860,6 +3122,8 @@ class SpotlightWindow:
         filter_name = {"folders": "files", "documents": "files"}.get(filter_name, filter_name)
         if filter_name not in self.FILTER_META or filter_name == self.current_filter:
             filter_name = "all"
+        if filter_name == "clipboard" and self.current_filter != "clipboard":
+            self.clip_kind = "all"
         self.current_filter = filter_name
         lit = "actions" if filter_name == "windows" else filter_name
         for key, button in self.filter_buttons.items():
@@ -2871,7 +3135,7 @@ class SpotlightWindow:
         self.entry.set_placeholder_text(placeholder)
         self.badge_num.set_text(badge or "")
         self.badge_box.set_visible(badge is not None)
-        self.results_panel.set_size_request(1000 if filter_name == "files" else 750, -1)
+        self.results_panel.set_size_request(1000 if filter_name in ("files", "clipboard") else 750, -1)
         self.preview_box.set_visible(False)
         self.on_search_changed(self.entry)
 
@@ -2895,10 +3159,17 @@ class SpotlightWindow:
         if mode == "all" and raw_text.lower().startswith(("fs:", "fs ")):
             GLib.idle_add(self._switch_to_files, raw_text[3:].lstrip())
             return
+        command = self._COMMAND_RE.match(raw_text)
+        if command and mode != "clipboard":
+            GLib.idle_add(self._switch_to_clipboard, raw_text[command.end():])
+            return
         if mode == "all":
             self.badge_box.set_visible(False)
             if not raw_text:
                 self.dismiss_results()
+                return
+            if raw_text.startswith(":"):
+                self.render_commands(raw_text)
                 return
             self.search_everything(raw_text, query, gen)
         elif mode == "apps":
@@ -2925,15 +3196,20 @@ class SpotlightWindow:
             results = sorted(self.get_window_results(query.lower()), key=lambda r: r[0], reverse=True)
             self.render_results([r[1] for r in results])
         elif mode == "clipboard":
-            self.set_footer(["⏎ copy", "Delete forget it"], "Ctrl 4 show everything")
+            paste = "⇧⏎ paste" if shutil.which("wtype") else "⇧⏎ paste (needs wtype)"
+            self.set_footer(["⏎ copy", paste, "Ctrl S star", "Tab kind", "Delete forget it"], "Ctrl 4 show everything")
             items = self.get_clipboard_items(query.lower())
             if not items:
+                empty = {
+                    "all": "Nothing copied yet", "starred": "Nothing starred yet", "images": "No pictures copied",
+                    "links": "No links copied", "files": "No files copied", "text": "No text copied",
+                }[self.clip_kind]
                 items = [{
-                    "title": "No matches in the clipboard" if query else "Nothing copied yet",
-                    "subtitle": "Things you copy show up here for 8 hours, until you log out",
+                    "title": "No matches in the clipboard" if query else empty,
+                    "subtitle": "Copies stay for a day, until you log out. Press Ctrl S to star one and keep it.",
                     "icon_file": os.path.join(ICONS_DIR, "clipboard.svg"),
                 }]
-            self.render_results(items)
+            self.render_results([{"kind": "clip_kinds"}] + items)
 
     # ── Everything mode: a top hit, then one section per kind ──
 
@@ -3027,6 +3303,29 @@ class SpotlightWindow:
         self.render_results(items)
         if top is not None:
             GLib.idle_add(self._ghost_from, st["raw"], [top])
+
+    # ":clipboard" (or ":cb") then a space or nothing: open the clipboard history.
+    _COMMAND_RE = re.compile(r"^:(?:clipboard|cb)(?:\s+|$)", re.I)
+    COMMANDS = [(":clipboard", "Clipboard history", "Everything you copied: pictures, links, files and text")]
+
+    def _switch_to_clipboard(self, rest):
+        self.entry.set_text(rest)
+        self.entry.set_position(-1)
+        if self.current_filter != "clipboard":
+            self.toggle_filter("clipboard")
+        return False
+
+    def render_commands(self, raw_text):
+        """Typing ":" lists the commands; Tab finishes the name, ⏎ opens it."""
+        typed = raw_text.lower()
+        items = [{
+            "title": name, "subtitle": f"{title}. {about}",
+            "icon_file": os.path.join(ICONS_DIR, "clipboard.svg"),
+            "action": lambda n=name: self._switch_to_clipboard(""),
+        } for name, title, about in self.COMMANDS if name.startswith(typed)]
+        self.set_footer(["⏎ open", "Tab finish the name"], "Esc close")
+        self.render_results(items)
+        GLib.idle_add(self._ghost_from, raw_text, list(self.results_data))
 
     def _switch_to_files(self, rest):
         """The old "fs:" prefix now just opens the Files view."""
@@ -3217,6 +3516,7 @@ class SpotlightWindow:
     def _screenshot(self, area):
         folder = os.path.join(os.path.expanduser("~"), "Pictures")
         geometry = '-g "$(slurp)" ' if area else ""
+        self.clipboard.mark_next_as_screenshot()
         spawn_detached(
             f'mkdir -p "{folder}"; sleep 0.3; f="{folder}/Screenshot_$(date +%Y%m%d_%H%M%S).png"; '
             f'grim {geometry}"$f" && wl-copy --type image/png < "$f"',
@@ -3235,27 +3535,114 @@ class SpotlightWindow:
         )
         self._notify("Recording the screen", "Open TracePoint and choose Stop recording to finish.")
 
+    CLIP_KINDS = [("all", "All"), ("starred", "Starred"), ("images", "Images"),
+                  ("links", "Links"), ("files", "Files"), ("text", "Text")]
+    _CLIP_KIND_MATCH = {"images": ("image",), "links": ("link",), "files": ("files",), "text": ("text", "color")}
+
     def get_clipboard_items(self, query):
-        items = []
+        starred, recent = [], []
+        kinds = self._CLIP_KIND_MATCH.get(self.clip_kind)
         for clip in self.clipboard.entries():
-            if query and (clip["kind"] != "text" or query not in clip["text"].lower()):
+            if self.clip_kind == "starred" and not clip["starred"]:
                 continue
-            if clip["kind"] == "image":
-                title, detail, icon = "Image", "Image", "image-x-generic"
-            else:
-                lines = clip["text"].strip().splitlines()
-                title = lines[0].strip()[:160]
-                detail = f"{len(lines)} lines" if len(lines) > 1 else f"{len(clip['text'])} characters"
-                icon = "edit-paste"
-            items.append({
-                "kind": "clip",
-                "clip": clip,
-                "title": title,
-                "subtitle": f"{detail} · copied {self.format_ago(clip['time'])}",
-                "icon": icon,
-                "action": lambda c=clip: (ClipboardHistory.copy(c), self.hide()),
-            })
-        return items
+            if kinds and clip["kind"] not in kinds:
+                continue
+            if query and query not in clip["search"]:
+                continue
+            (starred if clip["starred"] else recent).append(self._clip_item(clip))
+        items = []
+        if starred and self.clip_kind != "starred":
+            items.append({"kind": "header", "title": "Starred, kept until you unstar"})
+        items += starred
+        if starred and recent:
+            items.append({"kind": "header", "title": "Recent"})
+        return items + recent
+
+    _CLIP_ICONS = {"image": "image-x-generic", "files": "folder", "link": "insert-link", "color": "applications-graphics", "text": "edit-paste"}
+
+    def _clip_item(self, clip):
+        return {
+            "kind": "clip",
+            "clip": clip,
+            "title": clip["title"],
+            "subtitle": self._clip_subtitle(clip),
+            "icon": self._CLIP_ICONS[clip["kind"]],
+            "thumb": clip["path"] if clip["kind"] == "image" else None,
+            "swatch": clip["title"] if clip["kind"] == "color" else None,
+            "hint": "★" if clip["starred"] else None,
+            "action": lambda c=clip: (ClipboardHistory.copy(c), self.hide()),
+            "alt_action": ("Paste", lambda c=clip: self.paste_clip(c)),
+        }
+
+    def _clip_subtitle(self, clip):
+        kind = clip["kind"]
+        if kind == "image":
+            parts = ["Screenshot" if clip["screenshot"] else "Image",
+                     clip["mime"].split("/")[-1].upper(), GLib.format_size(clip["size"])]
+        elif kind == "files":
+            count = len(clip["paths"])
+            parts = ["Files" if count > 1 else "File", "pastes as files"]
+        elif kind == "link":
+            host = urllib.parse.urlparse(clip["title"] if "://" in clip["title"] else "https://" + clip["title"]).hostname
+            parts = ["Link"] + ([host] if host else [])
+        elif kind == "color":
+            parts = ["Color"]
+        else:
+            lines = clip["text"].strip().splitlines()
+            parts = ["Text", f"{len(lines)} lines" if len(lines) > 1 else f"{len(clip['text'])} characters"]
+        if clip["src"] and clip["src"].lower() not in ClipboardHistory.SCREENSHOT_APPS:
+            parts.append(f"from {self._app_name(clip['src'])}")
+        parts.append(f"copied {self.format_ago(clip['time'])}")
+        return " · ".join(parts)
+
+    def _app_name(self, window_class):
+        """A window class as people know the app: "firefox" → "Firefox"."""
+        info = None
+        for desktop_id in (window_class, window_class.lower()):
+            try:
+                info = Gio.DesktopAppInfo.new(desktop_id + ".desktop")
+            except TypeError:
+                info = None
+            if info:
+                return info.get_name()
+        return window_class.rsplit(".", 1)[-1].capitalize()
+
+    def paste_clip(self, clip):
+        self.hide()
+        if shutil.which("wtype"):
+            ClipboardHistory.paste(clip)
+        else:
+            ClipboardHistory.copy(clip)
+            self._notify("Copied, not pasted", "Install wtype to paste straight into the window: sudo dnf install wtype")
+
+    def _refresh_clipboard(self, keep=None):
+        """Redraw the clipboard list, keeping the same copy selected when it's still there."""
+        self.on_search_changed(self.entry)
+        if keep is None:
+            return
+        for i, item in enumerate(self.results_data):
+            if item.get("kind") == "clip" and item["clip"]["digest"] == keep:
+                row = self.list_box.get_row_at_index(i)
+                self.list_box.select_row(row)
+                self.ensure_row_visible(row)
+                return
+
+    def toggle_star(self, clip):
+        if clip["starred"]:
+            self.clipboard.unstar(clip)
+        else:
+            self.clipboard.star(clip)
+        self._refresh_clipboard(keep=clip["digest"])
+
+    def cycle_clip_kind(self, step):
+        names = [k for k, _ in self.CLIP_KINDS]
+        self.clip_kind = names[(names.index(self.clip_kind) + step) % len(names)]
+        self.on_search_changed(self.entry)
+
+    def save_clip(self, clip):
+        target = self.clipboard.save_copy(clip)
+        if target:
+            self.show_in_folder(target)
 
     # ── Files mode: name matches, then matches inside files, with a preview ──
 
@@ -3324,12 +3711,16 @@ class SpotlightWindow:
         self.update_preview(item)
 
     def update_preview(self, item):
+        if self.current_filter == "clipboard":
+            self.update_clip_preview(item)
+            return
         if self.current_filter != "files":
             self.preview_box.set_visible(False)
             return
         if not item or item.get("kind") != "file":
             self.preview_box.set_visible(False)
             return
+        self._preview_for("file")
         path = item["path"]
         self.preview_item = item
         self.preview_gen += 1
@@ -3382,6 +3773,64 @@ class SpotlightWindow:
         else:
             self.preview_icon.set_from_icon_name(item["icon"])
             self.preview_stack.set_visible_child_name("icon")
+
+    def _preview_for(self, what):
+        clip = what == "clip"
+        self.preview_file_buttons.set_visible(not clip)
+        self.preview_clip_buttons.set_visible(clip)
+        for key, text in zip(self.preview_keys, ("Kind", "Size", "Copied" if clip else "Changed")):
+            key.set_text(text)
+        self.preview_picture.set_content_fit(Gtk.ContentFit.CONTAIN if clip else Gtk.ContentFit.COVER)
+
+    def update_clip_preview(self, item):
+        if not item or item.get("kind") != "clip":
+            self.preview_box.set_visible(False)
+            return
+        clip = item["clip"]
+        self.preview_item = item
+        self.preview_gen += 1
+        gen = self.preview_gen
+        self._preview_for("clip")
+        self.preview_box.set_visible(True)
+        self.preview_star_button.set_label("Unstar" if clip["starred"] else "Star")
+        self.preview_save_button.set_visible(clip["kind"] in ("image", "text", "link"))
+        self.preview_name.set_text(clip["title"] if clip["kind"] != "text" else (clip["title"][:80] or "Text"))
+        kinds = {"image": "Screenshot" if clip["screenshot"] else "Image", "files": "Files", "link": "Link", "color": "Color", "text": "Text"}
+        kind = kinds[clip["kind"]]
+        if clip["kind"] == "image":
+            kind += ", " + clip["mime"].split("/")[-1].upper()
+            size = GLib.format_size(clip["size"])
+        elif clip["kind"] == "files":
+            size = f"{len(clip['paths'])} file{'s' if len(clip['paths']) != 1 else ''}"
+        else:
+            size = f"{len(clip['text'])} characters"
+        self.preview_kind.set_text(kind)
+        self.preview_size.set_text(size)
+        copied = time.strftime("%b %-d, %H:%M", time.localtime(clip["time"]))
+        if clip["src"] and clip["src"].lower() not in ClipboardHistory.SCREENSHOT_APPS:
+            copied += f" from {self._app_name(clip['src'])}"
+        self.preview_changed.set_text(copied + (" · starred" if clip["starred"] else ""))
+
+        if clip["kind"] == "image":
+            self.preview_icon.set_from_icon_name("image-x-generic")
+            self.preview_stack.set_visible_child_name("icon")
+            path = clip["path"]
+
+            def load():
+                try:
+                    pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 640, 360, True)
+                except Exception:
+                    return
+                GLib.idle_add(self._show_preview_picture, gen, pixbuf)
+
+            threading.Thread(target=load, daemon=True).start()
+        elif clip["kind"] == "color":
+            self.preview_picture.set_paintable(self._make_icon({"swatch": clip["title"]}, 160).get_paintable())
+            self.preview_stack.set_visible_child_name("picture")
+        else:
+            body = "\n".join(clip["paths"]) if clip["kind"] == "files" else clip["text"]
+            self.preview_text.set_text("\n".join(body.strip().splitlines()[:14]) or " ")
+            self.preview_stack.set_visible_child_name("text")
 
     def _show_preview_picture(self, gen, pixbuf):
         if gen == self.preview_gen:
@@ -3467,6 +3916,17 @@ class SpotlightWindow:
             self.footer_box.append(spacer)
 
     def _make_icon(self, item, size):
+        if item.get("swatch"):
+            rgba = Gdk.RGBA()
+            if rgba.parse(item["swatch"]):
+                pixbuf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, size * 2, size * 2)
+                pixbuf.fill((round(rgba.red * 255) << 24) | (round(rgba.green * 255) << 16) | (round(rgba.blue * 255) << 8) | 0xFF)
+                img = Gtk.Image.new_from_paintable(Gdk.Texture.new_for_pixbuf(pixbuf))
+                img.add_css_class("clip-thumb")
+                img.set_pixel_size(size)
+                return img
+        if item.get("thumb"):
+            return self._make_thumb(item["thumb"], size)
         if item.get("icon_file") and os.path.exists(item["icon_file"]):
             img = Gtk.Image.new_from_file(item["icon_file"])
         elif item.get("icon") and os.path.isabs(item["icon"]) and os.path.exists(item["icon"]):
@@ -3474,6 +3934,34 @@ class SpotlightWindow:
         else:
             img = Gtk.Image.new_from_icon_name(item.get("icon", "application-x-executable"))
         img.set_pixel_size(size)
+        return img
+
+    def _make_thumb(self, path, size):
+        """A picture's thumbnail, loaded off the main thread the first time."""
+        img = Gtk.Image()
+        img.add_css_class("clip-thumb")
+        img.set_pixel_size(size)
+        texture = self.thumb_cache.get(path)
+        if texture is not None:
+            img.set_from_paintable(texture)
+            return img
+        img.set_from_icon_name("image-x-generic")
+
+        def load():
+            try:
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, size * 2, size * 2, True)
+            except Exception:
+                return
+            GLib.idle_add(show, Gdk.Texture.new_for_pixbuf(pixbuf))
+
+        def show(texture):
+            if len(self.thumb_cache) > 400:
+                self.thumb_cache.clear()
+            self.thumb_cache[path] = texture
+            img.set_from_paintable(texture)
+            return False
+
+        threading.Thread(target=load, daemon=True).start()
         return img
 
     def _build_row(self, item):
@@ -3490,6 +3978,23 @@ class SpotlightWindow:
             lbl.set_xalign(0)
             row.set_child(lbl)
             return row
+        if kind == "clip_kinds":
+            row.set_selectable(False)
+            row.set_activatable(False)
+            row.set_can_focus(False)
+            row.add_css_class("section-row")
+            chips = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            chips.add_css_class("clip-kinds")
+            for name, label in self.CLIP_KINDS:
+                chip = Gtk.Button(label=label)
+                chip.add_css_class("clip-kind")
+                if name == self.clip_kind:
+                    chip.add_css_class("active")
+                chip.set_can_focus(False)
+                chip.connect("clicked", lambda _b, n=name: (setattr(self, "clip_kind", n), self.on_search_changed(self.entry)))
+                chips.append(chip)
+            row.set_child(chips)
+            return row
         if kind == "clip_strip":
             row.set_selectable(False)
             row.set_activatable(False)
@@ -3501,7 +4006,7 @@ class SpotlightWindow:
                 card = Gtk.Button()
                 card.add_css_class("clip-card")
                 card.set_can_focus(False)
-                text = "Image" if clip["kind"] == "image" else " ".join(clip["text"].split())
+                text = " ".join(clip["text"].split()) if clip["kind"] in ("text", "link", "color") else clip["title"]
                 lbl = Gtk.Label(label=text[:200])
                 lbl.set_xalign(0)
                 lbl.set_yalign(0)
@@ -3583,7 +4088,7 @@ class SpotlightWindow:
 
     def _first_selectable(self):
         for i, item in enumerate(self.results_data):
-            if item.get("kind") not in ("header", "clip_strip"):
+            if item.get("kind") not in ("header", "clip_strip", "clip_kinds"):
                 return i
         return -1
 
@@ -3736,6 +4241,16 @@ class SpotlightWindow:
             self._move_selection(-1)
             return True
 
+        if keyval in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab) and not is_ctrl and self.current_filter == "clipboard":
+            self.cycle_clip_kind(-1 if keyval == Gdk.KEY_ISO_Left_Tab or is_shift else 1)
+            return True
+
+        if is_ctrl and keyval in (Gdk.KEY_s, Gdk.KEY_S) and self.current_filter == "clipboard":
+            item = self._selected_item()
+            if item and item.get("kind") == "clip":
+                self.toggle_star(item["clip"])
+            return True
+
         if keyval in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab) and not is_ctrl:
             if self.assigning_key:
                 return True
@@ -3767,7 +4282,7 @@ class SpotlightWindow:
                 item = self._selected_item()
                 if item and item.get("kind") == "clip":
                     self.clipboard.forget(item["clip"]["path"])
-                    self.on_search_changed(self.entry)
+                    self._refresh_clipboard()
                     return True
         return False
 
