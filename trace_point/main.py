@@ -2214,6 +2214,8 @@ class SpotlightWindow:
         self.file_index_building = False
         self.all_state = None
         self.files_state = None
+        # The folder being browsed in the Files view (None: search all files).
+        self.browse_dir = None
         self.ghost_text = ""
         self.assigning_key = None
         self.assigning_title = ""
@@ -2563,6 +2565,7 @@ class SpotlightWindow:
             ("Open", lambda: self.open_file(self.preview_item["path"])),
             ("Show in folder", lambda: self.show_in_folder(self.preview_item["path"])),
             ("Copy path", lambda: (self.copy_text(self.preview_item["path"]), self.hide())),
+            ("Trash", lambda: self.confirm_trash(self.preview_item)),
         ):
             button = Gtk.Button(label=label)
             button.add_css_class("preview-btn")
@@ -2662,11 +2665,13 @@ class SpotlightWindow:
 
     def on_result_right_click(self, gesture, n_press, x, y, item):
         gesture.set_state(Gtk.EventSequenceState.CLAIMED)
-        path = item.get("desktop_path")
-        if not path:
+        if not (item.get("desktop_path") or item.get("kind") == "file"):
             self.hide_context_menu()
             return
-        row = gesture.get_widget()
+        self._show_context_menu(item, gesture.get_widget(), x, y)
+
+    def _show_context_menu(self, item, row, x, y):
+        """Open the Delete menu at (x, y) inside row."""
         if isinstance(row, Gtk.ListBoxRow):
             self.list_box.select_row(row)
         origin_x, origin_y = x, y
@@ -2677,16 +2682,40 @@ class SpotlightWindow:
         self._ctx_anchor = (origin_x, origin_y)
         self._ctx_plan = None
         self.ctx_delete_btn.set_visible(True)
-        self.ctx_delete_btn.set_label("Delete")
+        self.ctx_delete_btn.set_label("Move to Trash" if item.get("kind") == "file" else "Delete")
         self.ctx_confirm_box.set_visible(False)
         self._place_context_menu(origin_x, origin_y, 168, 48)
         self._ctx_target = item
         self.ctx_menu.set_visible(True)
         self._blur_signature = None
 
+    def confirm_trash(self, item):
+        """Ask before moving a file or folder to the Trash (Ctrl Delete, preview button)."""
+        row = self.list_box.get_selected_row()
+        if row is None or self._selected_item() is not item:
+            row = next((self.list_box.get_row_at_index(i) for i, it in enumerate(self.results_data) if it is item), None)
+        if row is None:
+            return
+        # Anchor the question near the start of the row, just below its middle.
+        self._show_context_menu(item, row, 48, row.get_height() * 0.6)
+        self.on_context_delete(None)
+
     def on_context_delete(self, _button):
         item = self._ctx_target
         if not item:
+            return
+        if item.get("kind") == "file":
+            self._ctx_plan = {"kind": "trash", "path": item["path"]}
+            self.ctx_message.set_text(
+                f"Move “{item['title']}” to the Trash? You can put it back from the Trash in your file manager."
+            )
+            self.ctx_delete_btn.set_visible(False)
+            self.ctx_confirm_box.set_visible(True)
+            self.ctx_remove_btn.set_visible(True)
+            self.ctx_remove_btn.set_label("Move to Trash")
+            origin_x, origin_y = self._ctx_anchor
+            self._place_context_menu(origin_x, origin_y, 320, 140)
+            self._blur_signature = None
             return
         path = item.get("desktop_path")
         if not path:
@@ -2710,6 +2739,10 @@ class SpotlightWindow:
         plan = self._ctx_plan
         item = self._ctx_target or {}
         self.hide_context_menu()
+        if plan and plan.get("kind") == "trash":
+            self.trash_file(plan["path"])
+            self.entry.grab_focus()
+            return
         if not plan or plan.get("kind") in (None, "unknown"):
             return
         title = item.get("title") or plan.get("package") or "Application"
@@ -2727,6 +2760,18 @@ class SpotlightWindow:
             Gtk4LayerShell.set_keyboard_mode(self.win, Gtk4LayerShell.KeyboardMode.NONE)
             self._start_package_removal(plan, title)
             self.hide()
+
+    def trash_file(self, path):
+        try:
+            Gio.File.new_for_path(path).trash(None)
+        except GLib.Error as err:
+            self._notify("Couldn't move it to the Trash", err.message)
+            return
+        # Forget it (and, for a folder, everything in it) so searches stop finding it.
+        inside = path.rstrip(os.sep) + os.sep
+        self.file_index = [e for e in self.file_index if e[0] != path and not e[0].startswith(inside)]
+        self.preview_box.set_visible(False)
+        self.on_search_changed(self.entry)
 
     def _user_applications_dir(self):
         xdg_data_home = os.environ.get("XDG_DATA_HOME")
@@ -3124,6 +3169,8 @@ class SpotlightWindow:
             filter_name = "all"
         if filter_name == "clipboard" and self.current_filter != "clipboard":
             self.clip_kind = "all"
+        if filter_name != "files":
+            self.browse_dir = None
         self.current_filter = filter_name
         lit = "actions" if filter_name == "windows" else filter_name
         for key, button in self.filter_buttons.items():
@@ -3146,6 +3193,8 @@ class SpotlightWindow:
         gen = self.search_generation
         self._schedule_surface_repaint()
         self.set_ghost("")
+        # While browsing a folder, one click selects (and previews), two open.
+        self.list_box.set_activate_on_single_click(not self.browse_dir)
 
         if self.debounce_timer_id is not None:
             GLib.source_remove(self.debounce_timer_id)
@@ -3647,7 +3696,10 @@ class SpotlightWindow:
     # ── Files mode: name matches, then matches inside files, with a preview ──
 
     def search_files_view(self, query, gen):
-        self.set_footer(["⏎ open", "⇧⏎ show in folder", "Ctrl C copy path"], "Ctrl 2 show everything")
+        if self.browse_dir:
+            self.browse_folder_view(query, gen)
+            return
+        self.set_footer(["⏎ open", "⇧⏎ show in folder", "Ctrl C copy path", "Ctrl ⌦ trash"], "Ctrl 2 show everything")
         ql = query.lower()
         if not ql:
             items = [r[1] for r in self.get_common_folders()[:8] + self.get_common_documents()[:7]]
@@ -3658,6 +3710,84 @@ class SpotlightWindow:
         if len(ql) >= 3 and shutil.which("rg"):
             known = {i["path"] for i in items}
             self.debounce_timer_id = GLib.timeout_add(150, self.start_content_search, query, gen, known)
+
+    # ── Browsing: a folder's contents, without closing the window ──
+
+    def browse_into(self, path):
+        """List a folder's contents in the Files view; typing then filters it."""
+        self.browse_dir = path
+        if self.current_filter != "files":
+            self.entry.set_text("")
+            self.toggle_filter("files")
+        elif self.entry.get_text():
+            self.entry.set_text("")  # "changed" redraws the list
+        else:
+            self.on_search_changed(self.entry)
+        self.entry.set_placeholder_text(f"Search in {os.path.basename(path) or path}")
+        self.badge_num.set_text(os.path.basename(path) or path)
+        self.badge_box.set_visible(True)
+
+    def browse_up(self):
+        """Go to the parent folder, keeping the folder you came from selected."""
+        came_from = self.browse_dir
+        parent = os.path.dirname(came_from.rstrip(os.sep)) or os.sep
+        if parent == came_from:
+            return
+        self.browse_into(parent)
+        for idx, item in enumerate(self.results_data):
+            if item.get("path") == came_from:
+                row = self.list_box.get_row_at_index(idx)
+                self.list_box.select_row(row)
+                self.ensure_row_visible(row)
+                break
+
+    def stop_browsing(self):
+        """Back to searching all files."""
+        self.browse_dir = None
+        placeholder, badge = self.FILTER_META["files"]
+        self.entry.set_placeholder_text(placeholder)
+        self.badge_num.set_text(badge)
+        if self.entry.get_text():
+            self.entry.set_text("")
+        else:
+            self.on_search_changed(self.entry)
+
+    def browse_folder_view(self, query, gen):
+        self.set_footer(["⏎ or double-click open", "⌫ up a folder", "⇧⏎ show in folder", "Ctrl C copy path", "Ctrl ⌦ trash"], "Esc back to search")
+        folder = self.browse_dir
+        ql = query.lower()
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            names = []
+        rows = []
+        for name in names:
+            # Hidden files show only when the search starts with a dot.
+            if name.startswith(".") and not ql.startswith("."):
+                continue
+            path = os.path.join(folder, name)
+            is_dir = os.path.isdir(path)
+            quality = match_quality(ql, name.lower()) if ql else 0
+            if quality is None:
+                continue
+            # Best match first; with no search, folders first, then by name.
+            rows.append((-quality, not is_dir, name.lower(), path, is_dir))
+        rows.sort()
+        items = [self.make_file_item(path, is_dir, ql) for *_, path, is_dir in rows[:200]]
+        # Every row is in this folder, so say what it is instead of where.
+        for item in items:
+            if item["is_dir"]:
+                item["subtitle"] = "Folder"
+            else:
+                item["subtitle"] = item["subtitle"].partition(" · ")[2].capitalize() or "File"
+        if not items:
+            items = [{
+                "title": f"No matches in {os.path.basename(folder) or folder}" if ql else "Empty folder",
+                "subtitle": "Try other words, or press Esc to search everywhere." if ql else "Press Backspace to go up a folder.",
+                "icon": "folder",
+            }]
+        self.files_state = {"gen": gen, "items": items}
+        self.render_results(items)
 
     def start_content_search(self, query, gen, known):
         self.debounce_timer_id = None
@@ -4025,7 +4155,7 @@ class SpotlightWindow:
         top = item.get("top_hit") or kind == "answer"
         if top:
             row.add_css_class("top-hit")
-        if item.get("desktop_path"):
+        if item.get("desktop_path") or kind == "file":
             right_click = Gtk.GestureClick.new()
             right_click.set_button(Gdk.BUTTON_SECONDARY)
             right_click.connect("pressed", self.on_result_right_click, item)
@@ -4205,11 +4335,33 @@ class SpotlightWindow:
         is_super = bool(state & Gdk.ModifierType.SUPER_MASK)
         is_shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
 
+        if self.ctx_menu.get_visible():
+            if keyval == Gdk.KEY_Escape:
+                self.hide_context_menu()
+                return True
+            if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and self.ctx_confirm_box.get_visible() \
+                    and self.ctx_remove_btn.get_visible():
+                self.on_context_confirm(None)
+                return True
+
+        if keyval == Gdk.KEY_Delete and is_ctrl:
+            item = self._selected_item()
+            if item and item.get("kind") == "file":
+                self.confirm_trash(item)
+                return True
+
         if keyval == Gdk.KEY_Escape:
             if self.assigning_key:
                 self.stop_assigning()
+            elif self.browse_dir:
+                self.stop_browsing()
             else:
                 self.hide()
+            return True
+
+        # Backspace in an empty search goes up a folder while browsing.
+        if keyval == Gdk.KEY_BackSpace and self.browse_dir and not self.entry.get_text():
+            self.browse_up()
             return True
 
         # Ctrl/Alt/Super + 1..4: one kind only (press again for everything)
@@ -4556,6 +4708,9 @@ class SpotlightWindow:
         ]
 
     def open_file(self, path):
+        if os.path.isdir(path):
+            self.browse_into(path)
+            return
         spawn_detached(["xdg-open", path])
         self.hide()
 
@@ -4656,6 +4811,7 @@ class SpotlightWindow:
             self._buttons_reveal_timer = None
         self.fling_scroller.stop_fling()
         self.smooth_scroller.stop()
+        self.browse_dir = None
         self.entry.set_text("")
         self.current_filter = "all"
         self.entry.set_placeholder_text("TracePoint Search")
