@@ -76,7 +76,8 @@ import gi
 gi.require_version('Gtk', '4.0')
 gi.require_version('Gtk4LayerShell', '1.0')
 gi.require_version('GdkPixbuf', '2.0')
-from gi.repository import Gtk, Gdk, Gtk4LayerShell, GLib, Gio, Pango, GdkPixbuf
+from gi.repository import Gtk, Gdk, Gtk4LayerShell, GLib, Gio, Pango, GdkPixbuf, Graphene
+import cairo
 
 # Clean LD_PRELOAD from process environment so spawned applications (Electron, GTK3, etc.) do not crash
 if "LD_PRELOAD" in os.environ:
@@ -397,6 +398,7 @@ mv "$n.part" "$n"
         self._meta = {}
         self._ocr_tried = set()
         self._ocr_running = False
+        self.max_age = self.MAX_AGE
 
     def start(self):
         if not shutil.which("wl-paste"):
@@ -446,7 +448,7 @@ mv "$n.part" "$n"
             for name in sorted(self._names(folder), reverse=True):
                 path = os.path.join(folder, name)
                 stamp = int(name) / 1e9
-                if not starred and (kept >= self.MAX_ITEMS or now - stamp > self.MAX_AGE):
+                if not starred and (kept >= self.MAX_ITEMS or now - stamp > self.max_age):
                     self.forget(path)
                     continue
                 entry = self._read(path, stamp)
@@ -717,6 +719,80 @@ def save_quick_keys(keys):
             json.dump(data, f, indent=2)
     except OSError:
         pass
+
+
+SETTINGS_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "trace_point", "settings.json"
+)
+# Clipboard retention choices, in hours. 24 matches the old fixed limit.
+CLIPBOARD_KEEP = (1, 6, 12, 24, 72, 168)
+DEFAULT_SETTINGS = {"blur": True, "margin_top": 160, "clipboard_hours": 24}
+# ":cb" is the short form of :clipboard and stays out of the command list.
+COMMANDS = (
+    (":clipboard", "Clipboard history", "Everything you copied: pictures, links, files and text", "clipboard", "clipboard.svg"),
+    (":settings", "Settings", "Blur, how long copies stay, and where the bar sits", "settings", "settings.svg"),
+)
+COMMAND_ALIASES = {":cb": ":clipboard"}
+
+
+def clipboard_keep_phrase(hours):
+    return {1: "1 hour", 6: "6 hours", 12: "12 hours", 24: "a day", 72: "3 days", 168: "a week"}.get(hours, f"{hours} hours")
+
+
+def load_settings():
+    data = dict(DEFAULT_SETTINGS)
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return data
+    if not isinstance(saved, dict):
+        return data
+    if isinstance(saved.get("blur"), bool):
+        data["blur"] = saved["blur"]
+    margin = saved.get("margin_top")
+    if isinstance(margin, (int, float)):
+        data["margin_top"] = int(max(48, min(420, margin)))
+    hours = saved.get("clipboard_hours")
+    if isinstance(hours, (int, float)):
+        hours = int(hours)
+        data["clipboard_hours"] = min(CLIPBOARD_KEEP, key=lambda choice: abs(choice - hours))
+    return data
+
+
+def save_settings(data):
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "blur": bool(data["blur"]),
+                    "margin_top": int(data["margin_top"]),
+                    "clipboard_hours": int(data["clipboard_hours"]),
+                },
+                f,
+                indent=2,
+            )
+            f.write("\n")
+    except OSError:
+        pass
+
+
+def resolve_command(raw_text):
+    """Return (target, rest) when the field is a whole command, else None.
+
+    ":clipboard notes" opens the clipboard searched for "notes". ":settings"
+    opens settings. A prefix such as ":set" is not a command yet, so the
+    list of matches can still show.
+    """
+    if not raw_text.startswith(":"):
+        return None
+    head, _, rest = raw_text.partition(" ")
+    name = COMMAND_ALIASES.get(head.lower(), head.lower())
+    for cmd_name, _title, _about, target, _icon in COMMANDS:
+        if name == cmd_name:
+            return target, rest.strip()
+    return None
 
 
 _PKG_NAME_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
@@ -1115,7 +1191,7 @@ window {
     font-weight: 600;
 }
 
-/* ── 4 Circular Action Buttons ── */
+/* ── Circular action buttons ── */
 button.spotlight-circle-btn {
     background-color: rgba(32, 36, 44, 0.46);
     border: 1px solid rgba(255, 255, 255, 0.30);
@@ -1155,10 +1231,16 @@ revealer {
     background-color: rgba(28, 32, 40, 0.42);
     border: 1px solid rgba(255, 255, 255, 0.24);
     border-radius: 28px;
-    margin-top: 14px;
     padding: 10px;
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16), 0 24px 60px rgba(0, 0, 0, 0.32);
-    transition: opacity 160ms cubic-bezier(0.16, 1, 0.3, 1), box-shadow 200ms cubic-bezier(0.16, 1, 0.3, 1);
+    /* The drop shadow is painted behind this panel. GTK's box-shadow blur is
+       a low-resolution texture, and a wide one bands. */
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16);
+    transition: opacity 160ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+drawingarea.spotlight-shadow {
+    background: none;
+    background-color: transparent;
 }
 
 .spotlight-results-panel scrolledwindow,
@@ -1435,6 +1517,87 @@ list > row.section-row:hover {
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", sans-serif;
     font-size: 12px;
     color: rgba(255, 255, 255, 0.62);
+}
+
+/* ── Settings rows ── */
+list > row.setting-row,
+list > row.setting-row:hover,
+list > row.setting-row:selected,
+list > row.setting-row:focus {
+    background-color: transparent;
+    padding: 8px 14px;
+}
+
+.setting-title {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", sans-serif;
+    font-size: 15px;
+    font-weight: 500;
+    color: #f5f5f7;
+}
+
+.setting-sub {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", sans-serif;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.65);
+}
+
+.setting-value {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", sans-serif;
+    font-size: 12px;
+    font-weight: 600;
+    color: #ffffff;
+    min-width: 72px;
+}
+
+.spotlight-results-panel switch {
+    background-color: rgba(255, 255, 255, 0.18);
+    border: none;
+    border-radius: 9999px;
+    min-width: 48px;
+    min-height: 28px;
+    box-shadow: none;
+}
+
+.spotlight-results-panel switch:checked {
+    background-color: #007aff;
+}
+
+.spotlight-results-panel switch slider {
+    background-color: #ffffff;
+    border-radius: 9999px;
+    min-width: 22px;
+    min-height: 22px;
+    margin: 3px;
+    box-shadow: none;
+}
+
+.spotlight-results-panel switch:disabled {
+    opacity: 0.45;
+}
+
+.spotlight-results-panel scale {
+    min-width: 168px;
+    min-height: 28px;
+    padding: 0;
+}
+
+.spotlight-results-panel scale trough {
+    background-color: rgba(255, 255, 255, 0.16);
+    border-radius: 9999px;
+    min-height: 4px;
+}
+
+.spotlight-results-panel scale highlight {
+    background-color: #007aff;
+    border-radius: 9999px;
+}
+
+.spotlight-results-panel scale slider {
+    background-color: #ffffff;
+    border-radius: 9999px;
+    min-width: 16px;
+    min-height: 16px;
+    box-shadow: none;
 }
 
 /* ── File preview beside the list ── */
@@ -1975,6 +2138,220 @@ def rounded_rect_bands(x, y, w, h, radius):
     return merged
 
 
+# The results panel used to wear a CSS box-shadow (0 24px 60px). GTK paints
+# that by blurring a downscaled mask, so a wide shadow breaks into blocks.
+# A full-resolution blur of one small rounded rect, sliced into corners and
+# edges, stays smooth at any panel size and is built once.
+SHADOW_BLUR = 42
+SHADOW_OFFSET_Y = 16
+SHADOW_OPACITY = 0.36
+SHADOW_RADIUS = 28
+SHADOW_PAD_X = SHADOW_BLUR + 8
+SHADOW_PAD_TOP = SHADOW_BLUR - SHADOW_OFFSET_Y + 6
+SHADOW_PAD_BOTTOM = SHADOW_BLUR + SHADOW_OFFSET_Y + 8
+_SHADOW_SPRITE = None
+
+
+def _round_rect(ctx, x, y, w, h, radius):
+    radius = max(0.0, min(float(radius), w / 2.0, h / 2.0))
+    ctx.new_sub_path()
+    ctx.arc(x + w - radius, y + radius, radius, -math.pi / 2, 0)
+    ctx.arc(x + w - radius, y + h - radius, radius, 0, math.pi / 2)
+    ctx.arc(x + radius, y + h - radius, radius, math.pi / 2, math.pi)
+    ctx.arc(x + radius, y + radius, radius, math.pi, math.pi * 1.5)
+    ctx.close_path()
+
+
+def _box_blur_a8(buf, width, height, stride, radius):
+    """Clamp-to-edge box blur. Three passes approximate a gaussian."""
+    if radius < 1:
+        return
+    tmp = bytearray(height * stride)
+    div = radius * 2 + 1
+    half = div // 2
+    for y in range(height):
+        row = y * stride
+        acc = 0
+        for i in range(-radius, radius + 1):
+            x = 0 if i < 0 else (width - 1 if i >= width else i)
+            acc += buf[row + x]
+        for x in range(width):
+            tmp[row + x] = (acc + half) // div
+            remove_x = x - radius
+            add_x = x + radius + 1
+            if remove_x < 0:
+                remove_x = 0
+            if add_x >= width:
+                add_x = width - 1
+            acc += int(buf[row + add_x]) - int(buf[row + remove_x])
+    for x in range(width):
+        acc = 0
+        for i in range(-radius, radius + 1):
+            y = 0 if i < 0 else (height - 1 if i >= height else i)
+            acc += tmp[y * stride + x]
+        for y in range(height):
+            buf[y * stride + x] = (acc + half) // div
+            remove_y = y - radius
+            add_y = y + radius + 1
+            if remove_y < 0:
+                remove_y = 0
+            if add_y >= height:
+                add_y = height - 1
+            acc += tmp[add_y * stride + x] - tmp[remove_y * stride + x]
+
+
+def _build_shadow_sprite():
+    """Blur one rounded rect and remember where its corners and edges are.
+
+    The shape is large enough that a straight edge isn't contaminated by the
+    opposite side, and inset far enough that the kernel never hits the canvas
+    border (a clamped border would lift the tail of the shadow).
+    """
+    blur = SHADOW_BLUR
+    radius = SHADOW_RADIUS
+    # Three box blurs of this radius have sigma ≈ blur/2, which is the CSS
+    # meaning of a blur radius.
+    box_r = max(1, int(round(blur / 2.0 - 0.5)))
+    inset = box_r * 3 + 2
+    shape = radius * 2 + 1 + box_r * 2
+    canvas = inset * 2 + shape
+    mask = cairo.ImageSurface(cairo.FORMAT_A8, canvas, canvas)
+    ctx = cairo.Context(mask)
+    ctx.set_antialias(cairo.ANTIALIAS_BEST)
+    ctx.set_source_rgba(1, 1, 1, 1)
+    _round_rect(ctx, inset, inset, shape, shape, radius)
+    ctx.fill()
+    buf = mask.get_data()
+    stride = mask.get_stride()
+    for _pass in range(3):
+        _box_blur_a8(buf, canvas, canvas, stride, box_r)
+    mask.mark_dirty()
+
+    sprite = cairo.ImageSurface(cairo.FORMAT_ARGB32, canvas, canvas)
+    out = sprite.get_data()
+    out_stride = sprite.get_stride()
+    opacity = SHADOW_OPACITY
+    little = sys.byteorder == "little"
+    for y in range(canvas):
+        src = y * stride
+        dst = y * out_stride
+        for x in range(canvas):
+            alpha = int(buf[src + x] * opacity + 0.5)
+            o = dst + x * 4
+            if little:
+                out[o] = 0
+                out[o + 1] = 0
+                out[o + 2] = 0
+                out[o + 3] = alpha
+            else:
+                out[o] = alpha
+                out[o + 1] = 0
+                out[o + 2] = 0
+                out[o + 3] = 0
+    sprite.mark_dirty()
+    corner = blur + radius
+    # Top-left of the corner tile: the blur starts this far outside the shape.
+    origin = inset - blur
+    return {"sprite": sprite, "corner": corner, "origin": origin, "canvas": canvas}
+
+
+def get_shadow_sprite():
+    global _SHADOW_SPRITE
+    if _SHADOW_SPRITE is None:
+        _SHADOW_SPRITE = _build_shadow_sprite()
+    return _SHADOW_SPRITE
+
+
+def _blit_slice(ctx, sprite, sx, sy, sw, sh, dx, dy, dw, dh):
+    if dw < 0.5 or dh < 0.5 or sw < 0.5 or sh < 0.5:
+        return
+    ctx.save()
+    ctx.translate(dx, dy)
+    ctx.scale(dw / sw, dh / sh)
+    ctx.rectangle(0, 0, sw, sh)
+    ctx.clip()
+    ctx.set_source_surface(sprite, -sx, -sy)
+    ctx.get_source().set_filter(cairo.FILTER_NEAREST)
+    ctx.paint()
+    ctx.restore()
+
+
+def paint_results_shadow(ctx, panel_x, panel_y, panel_w, panel_h):
+    """Drop shadow of the results panel. (panel_*) is its border box."""
+    if panel_w < SHADOW_RADIUS * 2 or panel_h < SHADOW_RADIUS * 2:
+        return
+    info = get_shadow_sprite()
+    sprite = info["sprite"]
+    corner = info["corner"]
+    origin = info["origin"]
+    canvas = info["canvas"]
+    blur = SHADOW_BLUR
+    radius = SHADOW_RADIUS
+    # The shadow is the same rounded rect, shifted down.
+    shape_x = panel_x
+    shape_y = panel_y + SHADOW_OFFSET_Y
+    shape_w = panel_w
+    shape_h = panel_h
+    left = shape_x - blur
+    top = shape_y - blur
+    ctx.save()
+    ctx.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
+    ctx.rectangle(left - 4, top - 4, shape_w + blur * 2 + 8, shape_h + blur * 2 + 8)
+    _round_rect(ctx, panel_x, panel_y, panel_w, panel_h, radius)
+    ctx.clip()
+    # Corners stay 1:1. Edges stretch along the straight side only.
+    span_x = shape_w - 2 * radius
+    span_y = shape_h - 2 * radius
+    _blit_slice(ctx, sprite, origin, origin, corner, corner, left, top, corner, corner)
+    _blit_slice(ctx, sprite, canvas - origin - corner, origin, corner, corner,
+                left + shape_w + blur * 2 - corner, top, corner, corner)
+    _blit_slice(ctx, sprite, origin, canvas - origin - corner, corner, corner,
+                left, top + shape_h + blur * 2 - corner, corner, corner)
+    _blit_slice(ctx, sprite, canvas - origin - corner, canvas - origin - corner, corner, corner,
+                left + shape_w + blur * 2 - corner, top + shape_h + blur * 2 - corner, corner, corner)
+    # First pixel of the straight edge, just past the corner curve.
+    edge_x = origin + corner
+    edge_y = origin + corner
+    _blit_slice(ctx, sprite, edge_x, origin, 1, corner, left + corner, top, span_x, corner)
+    _blit_slice(ctx, sprite, edge_x, canvas - origin - corner, 1, corner,
+                left + corner, top + shape_h + blur * 2 - corner, span_x, corner)
+    _blit_slice(ctx, sprite, origin, edge_y, corner, 1, left, top + corner, corner, span_y)
+    _blit_slice(ctx, sprite, canvas - origin - corner, edge_y, corner, 1,
+                left + shape_w + blur * 2 - corner, top + corner, corner, span_y)
+    mid = canvas // 2
+    _blit_slice(ctx, sprite, mid, mid, 1, 1, left + corner, top + corner, span_x, span_y)
+    ctx.restore()
+
+
+class SoftShadow(Gtk.DrawingArea):
+    """Paints the results-panel shadow in the margin around the glass."""
+
+    def __init__(self, panel):
+        super().__init__()
+        self._panel = panel
+        self.add_css_class("spotlight-shadow")
+        self.set_can_target(False)
+        self.set_hexpand(True)
+        self.set_vexpand(True)
+        self.set_draw_func(self._draw)
+
+    def _draw(self, _area, ctx, width, height, _data=None):
+        panel = self._panel
+        if panel is None or width < 4 or height < 4 or panel.get_width() < 4:
+            return
+        result = panel.compute_bounds(self)
+        rect = None
+        if isinstance(result, tuple):
+            if not result or result[0] is False:
+                return
+            rect = result[1] if len(result) > 1 else None
+        else:
+            rect = result
+        if rect is None:
+            return
+        paint_results_shadow(ctx, rect.get_x(), rect.get_y(), rect.get_width(), rect.get_height())
+
+
 class _WlMessage(ctypes.Structure):
     _fields_ = [
         ("name", ctypes.c_char_p),
@@ -2255,6 +2632,78 @@ class SmoothScroller:
     def animate_to(self, adj, target, duration_ms=240.0):
         self._spring.animate_to(adj, target, duration_ms=duration_ms, bounce=True)
 
+
+def _rect_covers(outer, inner, slack=2.0):
+    """True when outer contains inner, with a few pixels of slack."""
+    if outer is None or inner is None:
+        return False
+    ox, oy, ow, oh = outer
+    ix, iy, iw, ih = inner
+    return (
+        ox <= ix + slack
+        and oy <= iy + slack
+        and ox + ow + slack >= ix + iw
+        and oy + oh + slack >= iy + ih
+    )
+
+
+def _rect_union(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    x0 = min(ax, bx)
+    y0 = min(ay, by)
+    x1 = max(ax + aw, bx + bw)
+    y1 = max(ay + ah, by + bh)
+    return (x0, y0, x1 - x0, y1 - y0)
+
+
+def _rect_key(rect):
+    """Integer bounds. Subpixel noise must not refresh blur on every paint."""
+    if rect is None:
+        return None
+    return tuple(round(float(v)) for v in rect)
+
+
+def _rect_intersection(a, b):
+    if a is None or b is None:
+        return None
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    x0 = max(ax, bx)
+    y0 = max(ay, by)
+    x1 = min(ax + aw, bx + bw)
+    y1 = min(ay + ah, by + bh)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return None
+    return (x0, y0, x1 - x0, y1 - y0)
+
+
+class SpotlightBackdrop(Gtk.Box):
+    """Fullscreen layer behind the bar.
+
+    Painting the stale results rect happens here, after the children, so it
+    lands in the same frame as the shrink.
+    """
+
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._ink_host = None
+        self.add_css_class("spotlight-backdrop")
+
+    def set_ink_host(self, host):
+        self._ink_host = host
+
+    def do_snapshot(self, snapshot):
+        Gtk.Box.do_snapshot(self, snapshot)
+        host = self._ink_host
+        if host is not None:
+            host._paint_stale_results(snapshot)
+
+
 class SpotlightWindow:
     def __init__(self, app):
         self.app = app
@@ -2277,7 +2726,9 @@ class SpotlightWindow:
         self.preview_gen = 0
         self.preview_item = None
         self.quick_keys = load_quick_keys()
+        self.settings = load_settings()
         self.clipboard = ClipboardHistory()
+        self.clipboard.max_age = self.settings["clipboard_hours"] * 3600
         self.clip_kind = "all"
         self.thumb_cache = {}
 
@@ -2293,7 +2744,7 @@ class SpotlightWindow:
         # Open/close fades the bar in place. Moving it (margin or a transform)
         # either reflows the fullscreen window or leaves it off the blur.
         self.anim_state = "closed"
-        self.margin_rest = 160
+        self.margin_rest = self.settings["margin_top"]
         self._fade_tick_id = None
         self._fade_start = 0.0
         self._fade_target = 0.0
@@ -2304,6 +2755,8 @@ class SpotlightWindow:
         self._ctx_anchor = (0, 0)
         self._blur_tick_id = None
         self._blur_signature = None
+        self._results_ink = None
+        self._ink_cleanup_id = None
         self.blur = BackgroundBlur()
         self.RESULTS_RADIUS = 28
         self.MENU_RADIUS = 16
@@ -2343,8 +2796,7 @@ class SpotlightWindow:
         self.win.set_opacity(1.0)
 
         # Fullscreen transparent root container
-        self.root_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.root_box.add_css_class("spotlight-backdrop")
+        self.root_box = SpotlightBackdrop()
         self.root_box.set_hexpand(True)
         self.root_box.set_vexpand(True)
 
@@ -2419,7 +2871,8 @@ class SpotlightWindow:
         self.buttons_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         self.buttons_box.add_css_class("spotlight-buttons")
 
-        # Tahoe's four: Applications, Files, Actions, Clipboard
+        # Applications, Files, Actions, Clipboard, then Settings.
+        # Settings is not a search mode, so Tab does not land on it.
         self.filter_buttons = {}
         for key, icon, tip in (
             ("apps", "apps.svg", "Applications (Ctrl 1)"),
@@ -2437,6 +2890,15 @@ class SpotlightWindow:
             self.buttons_box.append(button)
             self.filter_buttons[key] = button
 
+        self.settings_button = Gtk.Button()
+        self.settings_button.add_css_class("spotlight-circle-btn")
+        self.settings_button.set_overflow(Gtk.Overflow.HIDDEN)
+        self.settings_button.set_can_focus(False)
+        self.settings_button.set_child(Gtk.Image.new_from_file(os.path.join(ICONS_DIR, "settings.svg")))
+        self.settings_button.set_tooltip_text("Settings")
+        self.settings_button.connect("clicked", self.on_settings_clicked)
+        self.buttons_box.append(self.settings_button)
+
         self.buttons_revealer.set_child(self.buttons_box)
         self.buttons_revealer.set_reveal_child(True)
         self.bar_row.append(self.buttons_revealer)
@@ -2452,8 +2914,15 @@ class SpotlightWindow:
         self.results_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.results_panel.add_css_class("spotlight-results-panel")
         self.results_panel.set_size_request(750, -1)
-        self.results_panel.set_halign(Gtk.Align.CENTER)
+        self.results_panel.set_halign(Gtk.Align.FILL)
+        self.results_panel.set_hexpand(False)
         self.results_panel.set_overflow(Gtk.Overflow.HIDDEN)
+        # Room around the glass for the shadow. The shadow widget is the same
+        # cell, drawn first, and follows this panel's real bounds.
+        self.results_panel.set_margin_start(SHADOW_PAD_X)
+        self.results_panel.set_margin_end(SHADOW_PAD_X)
+        self.results_panel.set_margin_top(SHADOW_PAD_TOP)
+        self.results_panel.set_margin_bottom(SHADOW_PAD_BOTTOM)
 
         # Scrolled window with kinetic & touchpad support
         self.scrolled = Gtk.ScrolledWindow()
@@ -2486,7 +2955,13 @@ class SpotlightWindow:
         self.footer_box.add_css_class("spotlight-footer")
         self.results_panel.append(self.footer_box)
 
-        self.revealer.set_child(self.results_panel)
+        self.results_shadow = SoftShadow(self.results_panel)
+        self.results_shell = Gtk.Grid()
+        self.results_shell.set_halign(Gtk.Align.CENTER)
+        self.results_shell.attach(self.results_shadow, 0, 0, 1, 1)
+        self.results_shell.attach(self.results_panel, 0, 0, 1, 1)
+        self.revealer.set_child(self.results_shell)
+        self.revealer.set_halign(Gtk.Align.CENTER)
         self.revealer.set_reveal_child(False)
         self.revealer.connect("notify::child-revealed", lambda *_args: self._schedule_blur())
         self.revealer.connect("notify::reveal-child", lambda *_args: self._schedule_blur())
@@ -2539,6 +3014,9 @@ class SpotlightWindow:
 
         self.win.connect("map", self._on_window_map)
         self.win.connect("unmap", self._on_window_unmap)
+        # Host is wired after the results widgets exist. Snapshots during
+        # construction then have nothing to measure.
+        self.root_box.set_ink_host(self)
 
         # Capture phase so Escape closes the bar even while the entry has focus.
         key_controller = Gtk.EventControllerKey()
@@ -2666,6 +3144,15 @@ class SpotlightWindow:
         display = Gdk.Display.get_default()
         if display is not None:
             self.blur.setup(display)
+        # Build the shadow sprite off the first open, so results don't hitch.
+        GLib.idle_add(self._warm_shadow)
+        return False
+
+    def _warm_shadow(self):
+        try:
+            get_shadow_sprite()
+        except Exception:
+            pass
         return False
 
     def is_descendant_of(self, widget, ancestor):
@@ -2966,7 +3453,7 @@ class SpotlightWindow:
         if pill:
             shapes.append((*pill, pill[3] / 2.0))
         if self.buttons_revealer.get_child_revealed():
-            for button in self.filter_buttons.values():
+            for button in list(self.filter_buttons.values()) + [self.settings_button]:
                 rect = self._widget_rect(button, self.win)
                 if rect:
                     shapes.append((*rect, min(rect[2], rect[3]) / 2.0))
@@ -2980,7 +3467,12 @@ class SpotlightWindow:
                 shapes.append((*menu, self.MENU_RADIUS))
         return shapes
 
-    def _update_blur_regions(self):
+    def _update_blur_regions(self, redraw=True):
+        if not self.settings.get("blur", True):
+            if self._blur_signature is not None:
+                self.blur.clear()
+                self._blur_signature = None
+            return
         surface = self.win.get_surface()
         if surface is None or not self.blur.attach(surface):
             return
@@ -2993,9 +3485,12 @@ class SpotlightWindow:
             return
         self._blur_signature = signature
         self.blur.set_shapes(shapes)
-        # A small redraw commits the surface so Niri applies the new region.
-        # Redrawing the fullscreen window here uploaded the whole display.
-        self.pill_box.queue_draw()
+        # A small redraw commits the surface so the compositor applies the
+        # new region. Redrawing the fullscreen window uploaded the whole
+        # display. Skip the extra draw when this call is already inside a
+        # paint: that frame's commit carries the region.
+        if redraw:
+            self.pill_box.queue_draw()
 
     def _blur_geometry_moving(self):
         return (
@@ -3031,6 +3526,85 @@ class SpotlightWindow:
             self._blur_tick_id = None
         self.blur.clear()
         self._blur_signature = None
+        self._results_ink = None
+
+    def _current_results_rect(self):
+        """Window-space bounds of the results shell, including its shadow.
+
+        The revealer clips the shell. While a crossfade is running the
+        revealer keeps its size, so this stays put until the fade ends.
+        """
+        shell = self._widget_rect(self.results_shell, self.root_box)
+        revealer = self._widget_rect(self.revealer, self.root_box)
+        return _rect_intersection(shell, revealer)
+
+    def _clamp_ink(self, rect):
+        if rect is None:
+            return None
+        x, y, w, h = rect
+        pad = 2.0
+        x -= pad
+        y -= pad
+        w += pad * 2
+        h += pad * 2
+        rw = float(self.root_box.get_width())
+        rh = float(self.root_box.get_height())
+        if rw < 2 or rh < 2:
+            return None
+        x0 = max(0.0, x)
+        y0 = max(0.0, y)
+        x1 = min(rw, x + w)
+        y1 = min(rh, y + h)
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            return None
+        return (x0, y0, x1 - x0, y1 - y0)
+
+    def _paint_stale_results(self, snapshot):
+        """Drop a results shape that the new list no longer covers.
+
+        The ngl renderer keeps the fullscreen window buffer and only repaints
+        nodes that changed. A shorter list is a smaller widget, so the old
+        panel and shadow stay painted underneath it. A color over that old
+        rect puts it in this frame's damage. The following frame drops the
+        color, which is only that rect again, not the whole screen.
+
+        The compositor blur is a separate shape. The blur tick runs before
+        layout and only while a revealer is animating, so a list that gets
+        shorter while already open kept the previous tall region. This paint
+        is after layout, and the same frame's commit carries the new region.
+        """
+        rect = self._current_results_rect()
+        old = self._results_ink
+        if old is not None and not _rect_covers(rect, old):
+            area = self._clamp_ink(_rect_union(old, rect))
+            if area is None:
+                return
+            color = Gdk.RGBA()
+            color.red = 0.0
+            color.green = 0.0
+            color.blue = 0.0
+            color.alpha = 0.004
+            bounds = Graphene.Rect()
+            bounds.init(area[0], area[1], area[2], area[3])
+            snapshot.append_color(color, bounds)
+            self._schedule_ink_cleanup()
+        if _rect_key(rect) != _rect_key(old):
+            self._update_blur_regions(redraw=False)
+        self._results_ink = rect
+
+    def _schedule_ink_cleanup(self):
+        if self._ink_cleanup_id is not None:
+            return
+        self._ink_cleanup_id = GLib.idle_add(self._cleanup_ink)
+
+    def _cleanup_ink(self):
+        self._ink_cleanup_id = None
+        # The clear color is gone on this frame. Diffing it damages the old
+        # results rect. Drawing the pill, not the fullscreen root, keeps the
+        # upload to that rect plus the capsule.
+        if self.win.get_mapped():
+            self.pill_box.queue_draw()
+        return False
 
     def on_scroll(self, controller, dx, dy):
         if not self.revealer.get_child_revealed() or not self.results_data:
@@ -3264,12 +3838,7 @@ class SpotlightWindow:
         if filter_name != "files":
             self.browse_dir = None
         self.current_filter = filter_name
-        lit = "actions" if filter_name == "windows" else filter_name
-        for key, button in self.filter_buttons.items():
-            if key == lit:
-                button.add_css_class("active")
-            else:
-                button.remove_css_class("active")
+        self._mark_mode_buttons()
         placeholder, badge = self.FILTER_META[filter_name]
         self.entry.set_placeholder_text(placeholder)
         self.badge_num.set_text(badge or "")
@@ -3277,6 +3846,43 @@ class SpotlightWindow:
         self.results_panel.set_size_request(1000 if filter_name in ("files", "clipboard") else 750, -1)
         self.preview_box.set_visible(False)
         self.on_search_changed(self.entry)
+
+    def _mark_mode_buttons(self):
+        lit = "actions" if self.current_filter == "windows" else self.current_filter
+        for key, button in self.filter_buttons.items():
+            if key == lit:
+                button.add_css_class("active")
+            else:
+                button.remove_css_class("active")
+        if self.current_filter == "settings":
+            self.settings_button.add_css_class("active")
+        else:
+            self.settings_button.remove_css_class("active")
+
+    def on_settings_clicked(self, _button):
+        if self.assigning_key:
+            self.stop_assigning()
+        if self.current_filter == "settings":
+            self.toggle_filter("all")
+        else:
+            self._enter_settings()
+
+    def _enter_settings(self):
+        self.browse_dir = None
+        self.assigning_key = None
+        self.current_filter = "settings"
+        self._mark_mode_buttons()
+        self.entry.set_placeholder_text("Settings")
+        self.badge_num.set_text("Settings")
+        self.badge_box.set_visible(True)
+        self.results_panel.set_size_request(750, -1)
+        self.preview_box.set_visible(False)
+        if self.entry.get_text():
+            self.entry.set_text("")
+            self.entry.set_position(-1)
+        else:
+            self.on_search_changed(self.entry)
+        return False
 
     def on_search_changed(self, entry):
         raw_text = entry.get_text()
@@ -3301,9 +3907,28 @@ class SpotlightWindow:
         if mode == "all" and raw_text.lower().startswith(("fs:", "fs ")):
             GLib.idle_add(self._switch_to_files, raw_text[3:].lstrip())
             return
-        command = self._COMMAND_RE.match(raw_text)
-        if command and mode != "clipboard":
-            GLib.idle_add(self._switch_to_clipboard, raw_text[command.end():])
+        if raw_text.startswith(":"):
+            resolved = resolve_command(raw_text)
+            if resolved:
+                target, rest = resolved
+                if target == "clipboard" and mode != "clipboard":
+                    GLib.idle_add(self._switch_to_clipboard, rest)
+                    return
+                if target == "settings" and mode != "settings":
+                    GLib.idle_add(self._enter_settings)
+                    return
+        if mode == "settings":
+            if not query:
+                self.render_settings()
+                return
+            if raw_text.startswith(":"):
+                self.render_commands(raw_text)
+                return
+            # Typing a search leaves settings and looks through everything.
+            self.current_filter = "all"
+            self._mark_mode_buttons()
+            self.badge_box.set_visible(False)
+            self.search_everything(raw_text, query, gen)
             return
         if mode == "all":
             self.badge_box.set_visible(False)
@@ -3360,7 +3985,7 @@ class SpotlightWindow:
                 }[self.clip_kind]
                 items = [{
                     "title": "No matches in the clipboard" if query else empty,
-                    "subtitle": "Copies stay for a day, until you log out. Press Ctrl S to star one and keep it.",
+                    "subtitle": f"Copies stay for {clipboard_keep_phrase(self.settings['clipboard_hours'])}, until you log out. Press Ctrl S to star one and keep it.",
                     "icon_file": os.path.join(ICONS_DIR, "clipboard.svg"),
                 }]
             self.render_results([{"kind": "clip_kinds"}] + items)
@@ -3458,10 +4083,6 @@ class SpotlightWindow:
         if top is not None:
             GLib.idle_add(self._ghost_from, st["raw"], [top])
 
-    # ":clipboard" (or ":cb") then a space or nothing: open the clipboard history.
-    _COMMAND_RE = re.compile(r"^:(?:clipboard|cb)(?:\s+|$)", re.I)
-    COMMANDS = [(":clipboard", "Clipboard history", "Everything you copied: pictures, links, files and text")]
-
     def _switch_to_clipboard(self, rest):
         self.entry.set_text(rest)
         self.entry.set_position(-1)
@@ -3469,17 +4090,98 @@ class SpotlightWindow:
             self.toggle_filter("clipboard")
         return False
 
+    def _run_command(self, target):
+        if target == "settings":
+            self._enter_settings()
+        else:
+            self._switch_to_clipboard("")
+
     def render_commands(self, raw_text):
         """Typing ":" lists the commands; Tab finishes the name, ⏎ opens it."""
         typed = raw_text.lower()
         items = [{
             "title": name, "subtitle": f"{title}. {about}",
-            "icon_file": os.path.join(ICONS_DIR, "clipboard.svg"),
-            "action": lambda n=name: self._switch_to_clipboard(""),
-        } for name, title, about in self.COMMANDS if name.startswith(typed)]
+            "icon_file": os.path.join(ICONS_DIR, icon),
+            "action": (lambda t=target: self._run_command(t)),
+        } for name, title, about, target, icon in COMMANDS if name.startswith(typed)]
         self.set_footer(["⏎ open", "Tab finish the name"], "Esc close")
         self.render_results(items)
         GLib.idle_add(self._ghost_from, raw_text, list(self.results_data))
+
+    def _on_blur_toggled(self, switch, _pspec):
+        if not switch.get_sensitive():
+            return
+        self.settings["blur"] = switch.get_active()
+        save_settings(self.settings)
+        self._blur_signature = None
+        if self.settings["blur"]:
+            self._update_blur_regions()
+        else:
+            self.blur.clear()
+            self._blur_signature = None
+
+    def _on_margin_changed(self, scale):
+        value = int(round(scale.get_value()))
+        if abs(scale.get_value() - value) > 0.01:
+            scale.set_value(value)
+            return
+        self.settings["margin_top"] = value
+        self.margin_rest = value
+        self.center_box.set_margin_top(value)
+        if getattr(self, "_margin_value", None) is not None:
+            self._margin_value.set_text(f"{value} px")
+        save_settings(self.settings)
+        self._schedule_blur()
+
+    def _on_keep_changed(self, scale):
+        idx = int(round(scale.get_value()))
+        idx = max(0, min(len(CLIPBOARD_KEEP) - 1, idx))
+        if abs(scale.get_value() - idx) > 0.01:
+            scale.set_value(idx)
+            return
+        hours = CLIPBOARD_KEEP[idx]
+        self.settings["clipboard_hours"] = hours
+        self.clipboard.max_age = hours * 3600
+        if getattr(self, "_keep_value", None) is not None:
+            self._keep_value.set_text(clipboard_keep_phrase(hours))
+        save_settings(self.settings)
+        # Prune after the slider settles, so dragging across a short keep
+        # time doesn't throw copies away on the way to a longer one.
+        if getattr(self, "_keep_prune_id", None):
+            GLib.source_remove(self._keep_prune_id)
+        self._keep_prune_id = GLib.timeout_add(400, self._prune_clipboard)
+
+    def _prune_clipboard(self):
+        self._keep_prune_id = None
+        self.clipboard.entries()
+        return False
+
+    def render_settings(self):
+        blur_ok = self.blur.ready and not self.blur.disabled
+        self.set_footer(["Esc close"], "Gear back to search")
+        self.render_results([
+            {"kind": "header", "title": "Appearance"},
+            {
+                "kind": "setting",
+                "setting": "blur",
+                "title": "Background blur",
+                "subtitle": "Frost the wallpaper behind the glass" if blur_ok else "This compositor doesn't blur behind a window",
+                "enabled": blur_ok,
+            },
+            {
+                "kind": "setting",
+                "setting": "margin",
+                "title": "Distance from the top",
+                "subtitle": "Where the bar sits when it opens",
+            },
+            {"kind": "header", "title": "Clipboard"},
+            {
+                "kind": "setting",
+                "setting": "keep",
+                "title": "Keep copies",
+                "subtitle": "Starred copies stay either way",
+            },
+        ])
 
     def _switch_to_files(self, rest):
         """The old "fs:" prefix now just opens the Files view."""
@@ -4317,6 +5019,66 @@ class SpotlightWindow:
                 strip.append(card)
             row.set_child(strip)
             return row
+        if kind == "setting":
+            row.set_selectable(False)
+            row.set_activatable(False)
+            row.set_can_focus(False)
+            row.add_css_class("setting-row")
+            hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            vbox.set_hexpand(True)
+            vbox.set_valign(Gtk.Align.CENTER)
+            title = Gtk.Label(label=item["title"])
+            title.add_css_class("setting-title")
+            title.set_xalign(0)
+            vbox.append(title)
+            sub = Gtk.Label(label=item.get("subtitle", ""))
+            sub.add_css_class("setting-sub")
+            sub.set_xalign(0)
+            sub.set_ellipsize(Pango.EllipsizeMode.END)
+            vbox.append(sub)
+            hbox.append(vbox)
+            which = item.get("setting")
+            if which == "blur":
+                switch = Gtk.Switch()
+                switch.set_can_focus(False)
+                switch.set_valign(Gtk.Align.CENTER)
+                switch.set_active(bool(self.settings["blur"]) and item.get("enabled", True))
+                switch.set_sensitive(item.get("enabled", True))
+                switch.connect("notify::active", self._on_blur_toggled)
+                hbox.append(switch)
+            elif which == "margin":
+                value = Gtk.Label(label=f"{self.settings['margin_top']} px")
+                value.add_css_class("setting-value")
+                value.set_xalign(1)
+                value.set_valign(Gtk.Align.CENTER)
+                self._margin_value = value
+                scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 48, 420, 8)
+                scale.set_draw_value(False)
+                scale.set_can_focus(False)
+                scale.set_valign(Gtk.Align.CENTER)
+                scale.set_size_request(168, -1)
+                scale.set_value(self.settings["margin_top"])
+                scale.connect("value-changed", self._on_margin_changed)
+                hbox.append(scale)
+                hbox.append(value)
+            elif which == "keep":
+                value = Gtk.Label(label=clipboard_keep_phrase(self.settings["clipboard_hours"]))
+                value.add_css_class("setting-value")
+                value.set_xalign(1)
+                value.set_valign(Gtk.Align.CENTER)
+                self._keep_value = value
+                scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, len(CLIPBOARD_KEEP) - 1, 1)
+                scale.set_draw_value(False)
+                scale.set_can_focus(False)
+                scale.set_valign(Gtk.Align.CENTER)
+                scale.set_size_request(168, -1)
+                scale.set_value(CLIPBOARD_KEEP.index(self.settings["clipboard_hours"]))
+                scale.connect("value-changed", self._on_keep_changed)
+                hbox.append(scale)
+                hbox.append(value)
+            row.set_child(hbox)
+            return row
 
         row.add_css_class("result-row")
         top = item.get("top_hit") or kind == "answer"
@@ -4385,7 +5147,7 @@ class SpotlightWindow:
 
     def _first_selectable(self):
         for i, item in enumerate(self.results_data):
-            if item.get("kind") not in ("header", "clip_strip", "clip_kinds"):
+            if item.get("kind") not in ("header", "clip_strip", "clip_kinds", "setting"):
                 return i
         return -1
 
@@ -4960,13 +5722,12 @@ class SpotlightWindow:
         self.fling_scroller.stop_fling()
         self.smooth_scroller.stop()
         self.browse_dir = None
-        self.entry.set_text("")
+        self.assigning_key = None
         self.current_filter = "all"
+        self._mark_mode_buttons()
+        self.entry.set_text("")
         self.entry.set_placeholder_text("TracePoint Search")
         self.badge_box.set_visible(False)
-        for b in self.filter_buttons.values():
-            b.remove_css_class("active")
-        self.assigning_key = None
         self.set_ghost("")
         self.preview_box.set_visible(False)
         self.results_panel.set_size_request(750, -1)
@@ -5052,8 +5813,11 @@ class DaemonServer:
                     f, _, text = data[7:].strip().partition(" ")
                     def set_f(filt=f, text=text):
                         self.window.show()
-                        self.window.toggle_filter(filt)
-                        if text:
+                        if filt == "settings":
+                            self.window._enter_settings()
+                        else:
+                            self.window.toggle_filter(filt)
+                        if text and filt != "settings":
                             self.window.entry.set_text(text)
                             self.window.entry.set_position(-1)
                     GLib.idle_add(set_f)
