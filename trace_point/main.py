@@ -66,15 +66,6 @@ for _cand in [
 else:
     LAYER_SHELL_LIB = "/usr/lib64/libgtk4-layer-shell.so.0"
 
-# The GPU renderer only repaints the new glyph bounds. On a translucent
-# surface, fast backspace leaves the previous letters behind. Forcing a
-# full redraw clears them. Must be set before GTK creates its renderer,
-# and before the layer-shell re-exec so the new process inherits it.
-_gsk_debug = [part for part in os.environ.get("GSK_DEBUG", "").split(",") if part]
-if "full-redraw" not in _gsk_debug:
-    _gsk_debug.append("full-redraw")
-os.environ["GSK_DEBUG"] = ",".join(_gsk_debug)
-
 if os.path.exists(LAYER_SHELL_LIB) and LAYER_SHELL_LIB not in os.environ.get("LD_PRELOAD", ""):
     env = dict(os.environ)
     existing = env.get("LD_PRELOAD", "")
@@ -1031,6 +1022,8 @@ window {
     background: transparent;
 }
 
+/* Opacity is animated in code. A transform slides the bar off its blur
+   region, so the wallpaper text stays sharp inside the glass. */
 .spotlight-container {
     background: transparent;
     padding: 0px;
@@ -1047,6 +1040,12 @@ window {
     min-width: 470px;
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), 0 16px 36px rgba(0, 0, 0, 0.28);
     transition: border-color 200ms cubic-bezier(0.16, 1, 0.3, 1), box-shadow 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Toggled after each keystroke so the whole capsule is damaged, not just
+   the new glyphs. A global full-redraw made open and close upload the screen. */
+.spotlight-pill.glyph-clear {
+    background-color: rgba(32, 36, 44, 0.462);
 }
 
 .spotlight-pill:focus-within {
@@ -2291,21 +2290,15 @@ class SpotlightWindow:
         self.fling_scroller = self.spring_scroller  # compat alias
         self.smooth_scroller = SmoothScroller(self.spring_scroller)
 
-        # Animation states for Spotlight-like open/close (opacity + settle)
+        # Open/close fades the bar in place. Moving it (margin or a transform)
+        # either reflows the fullscreen window or leaves it off the blur.
         self.anim_state = "closed"
-        self.anim_start_us = 0
-        self.anim_duration_us = 200_000
-        self.anim_open_duration_us = 210_000
-        self.anim_close_duration_us = 150_000
-        self.start_opacity = 0.0
-        self.target_opacity = 1.0
-        self.start_margin = 148
-        self.target_margin = 160
         self.margin_rest = 160
-        self.margin_hidden = 148
-        self.tick_cb_id = None
+        self._fade_tick_id = None
+        self._fade_start = 0.0
+        self._fade_target = 0.0
+        self._fade_t0 = 0
         self.row_anim_generation = 0
-        self._buttons_reveal_timer = None
         self._ctx_target = None
         self._ctx_plan = None
         self._ctx_anchor = (0, 0)
@@ -2347,7 +2340,7 @@ class SpotlightWindow:
         Gtk4LayerShell.set_anchor(self.win, Gtk4LayerShell.Edge.BOTTOM, True)
         Gtk4LayerShell.set_anchor(self.win, Gtk4LayerShell.Edge.LEFT, True)
         Gtk4LayerShell.set_anchor(self.win, Gtk4LayerShell.Edge.RIGHT, True)
-        self.win.set_opacity(0.0)
+        self.win.set_opacity(1.0)
 
         # Fullscreen transparent root container
         self.root_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -2358,10 +2351,12 @@ class SpotlightWindow:
         # Spotlight centered container (160px from top)
         self.center_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.center_box.add_css_class("spotlight-container")
+        self.center_box.set_opacity(0.0)
         self.center_box.set_halign(Gtk.Align.CENTER)
         self.center_box.set_valign(Gtk.Align.START)
-        self.center_box.set_margin_top(160)
+        self.center_box.set_margin_top(self.margin_rest)
         self.center_box.set_size_request(750, -1)
+        self.center_box.set_overflow(Gtk.Overflow.VISIBLE)
 
         # Horizontal Row containing Capsule + Revealer for 4 Buttons
         self.bar_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -2414,12 +2409,15 @@ class SpotlightWindow:
 
         self.bar_row.append(self.pill_box)
 
-        # ── 4 Circular Buttons inside Revealer (Morphs & Slides Out) ──
+        # Buttons stay allocated. A revealer width animation recentered the
+        # pill and moved the blur region on every frame.
         self.buttons_revealer = Gtk.Revealer()
-        self.buttons_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
-        self.buttons_revealer.set_transition_duration(200)
+        self.buttons_revealer.set_transition_type(Gtk.RevealerTransitionType.NONE)
+        self.buttons_revealer.set_transition_duration(0)
+        self.buttons_revealer.set_overflow(Gtk.Overflow.VISIBLE)
 
         self.buttons_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.buttons_box.add_css_class("spotlight-buttons")
 
         # Tahoe's four: Applications, Files, Actions, Clipboard
         self.filter_buttons = {}
@@ -2440,7 +2438,7 @@ class SpotlightWindow:
             self.filter_buttons[key] = button
 
         self.buttons_revealer.set_child(self.buttons_box)
-        self.buttons_revealer.set_reveal_child(False)
+        self.buttons_revealer.set_reveal_child(True)
         self.bar_row.append(self.buttons_revealer)
 
         self.center_box.append(self.bar_row)
@@ -2490,8 +2488,8 @@ class SpotlightWindow:
 
         self.revealer.set_child(self.results_panel)
         self.revealer.set_reveal_child(False)
-        self.revealer.connect("notify::child-revealed", lambda *_args: self._schedule_surface_repaint())
-        self.revealer.connect("notify::reveal-child", lambda *_args: self._schedule_surface_repaint())
+        self.revealer.connect("notify::child-revealed", lambda *_args: self._schedule_blur())
+        self.revealer.connect("notify::reveal-child", lambda *_args: self._schedule_blur())
         self.center_box.append(self.revealer)
 
         self.root_box.append(self.center_box)
@@ -2995,19 +2993,34 @@ class SpotlightWindow:
             return
         self._blur_signature = signature
         self.blur.set_shapes(shapes)
-        self.win.queue_draw()
+        # A small redraw commits the surface so Niri applies the new region.
+        # Redrawing the fullscreen window here uploaded the whole display.
+        self.pill_box.queue_draw()
+
+    def _blur_geometry_moving(self):
+        return (
+            self.revealer.get_reveal_child() != self.revealer.get_child_revealed()
+            or self.buttons_revealer.get_reveal_child() != self.buttons_revealer.get_child_revealed()
+        )
+
+    def _schedule_blur(self):
+        if not self.win.get_mapped() or self._blur_tick_id is not None:
+            return
+        self._blur_tick_id = self.win.add_tick_callback(self._on_blur_tick)
 
     def _on_blur_tick(self, _widget, _frame_clock):
         if not self.win.get_visible():
             self._blur_tick_id = None
             return GLib.SOURCE_REMOVE
         self._update_blur_regions()
+        if not self._blur_geometry_moving():
+            self._blur_tick_id = None
+            return GLib.SOURCE_REMOVE
         return GLib.SOURCE_CONTINUE
 
     def _on_window_map(self, _window):
         self._blur_signature = None
-        if self._blur_tick_id is None:
-            self._blur_tick_id = self.win.add_tick_callback(self._on_blur_tick)
+        self._schedule_blur()
 
     def _on_window_unmap(self, _window):
         if self._blur_tick_id is not None:
@@ -3231,6 +3244,17 @@ class SpotlightWindow:
     }
     FILTER_ORDER = ["all", "apps", "files", "actions", "clipboard"]
 
+    def cycle_mode(self, step):
+        """Move between Everything, Applications, Files, Actions and Clipboard.
+
+        Windows is a page inside Actions, so it counts as Actions here.
+        """
+        order = self.FILTER_ORDER
+        current = "actions" if self.current_filter == "windows" else self.current_filter
+        if current not in order:
+            current = order[0]
+        self.toggle_filter(order[(order.index(current) + step) % len(order)])
+
     def toggle_filter(self, filter_name):
         filter_name = {"folders": "files", "documents": "files"}.get(filter_name, filter_name)
         if filter_name not in self.FILTER_META or filter_name == self.current_filter:
@@ -3291,7 +3315,10 @@ class SpotlightWindow:
                 return
             self.search_everything(raw_text, query, gen)
         elif mode == "apps":
-            self.set_footer(["↑ ↓ move", "⏎ open", "⇧⏎ second choice"], "Ctrl 1 show everything")
+            hints = ["↑ ↓ move", "⏎ open", "⇧⏎ second choice"]
+            if not query:
+                hints.append("Tab modes")
+            self.set_footer(hints, "Ctrl 1 show everything")
             results = self.get_app_results(query.lower())
             if query:
                 results.sort(key=lambda r: r[0], reverse=True)
@@ -3302,7 +3329,10 @@ class SpotlightWindow:
         elif mode == "files":
             self.search_files_view(query, gen)
         elif mode == "actions":
-            self.set_footer(["⏎ run", "Tab set a quick key"], "Ctrl 3 show everything")
+            self.set_footer(
+                ["⏎ run", "Tab modes" if not query else "Tab set a quick key"],
+                "Ctrl 3 show everything",
+            )
             results = sorted(self.get_action_results(query.lower()), key=lambda r: r[0], reverse=True)
             items = [r[1] for r in results]
             clips = self.clipboard.entries()[:3] if not query else []
@@ -3310,12 +3340,18 @@ class SpotlightWindow:
                 items += [{"kind": "header", "title": "Clipboard, last copied"}, {"kind": "clip_strip", "clips": clips}]
             self.render_results(items)
         elif mode == "windows":
-            self.set_footer(["⏎ switch"], "Ctrl 3 back to actions")
+            hints = ["⏎ switch"]
+            if not query:
+                hints.append("Tab modes")
+            self.set_footer(hints, "Ctrl 3 back to actions")
             results = sorted(self.get_window_results(query.lower()), key=lambda r: r[0], reverse=True)
             self.render_results([r[1] for r in results])
         elif mode == "clipboard":
             paste = "⇧⏎ paste" if shutil.which("wtype") else "⇧⏎ paste (needs wtype)"
-            self.set_footer(["⏎ or double-click copy", paste, "Ctrl S star", "Tab kind", "Delete forget it"], "Ctrl 4 show everything")
+            self.set_footer(
+                ["⏎ or double-click copy", paste, "Ctrl S star", "Tab modes" if not query else "Tab kind", "Delete forget it"],
+                "Ctrl 4 show everything",
+            )
             items = self.get_clipboard_items(query.lower())
             if not items:
                 empty = {
@@ -3825,7 +3861,10 @@ class SpotlightWindow:
         if self.browse_dir:
             self.browse_folder_view(query, gen)
             return
-        self.set_footer(["⏎ open", "⇧⏎ show in folder", "Ctrl C copy path", "Ctrl ⌦ trash"], "Ctrl 2 show everything")
+        hints = ["⏎ open", "⇧⏎ show in folder", "Ctrl C copy path", "Ctrl ⌦ trash"]
+        if not query:
+            hints.append("Tab modes")
+        self.set_footer(hints, "Ctrl 2 show everything")
         ql = query.lower()
         if not ql:
             items = [r[1] for r in self.get_common_folders()[:8] + self.get_common_documents()[:7]]
@@ -4521,10 +4560,6 @@ class SpotlightWindow:
             self._move_selection(-1)
             return True
 
-        if keyval in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab) and not is_ctrl and self.current_filter == "clipboard":
-            self.cycle_clip_kind(-1 if keyval == Gdk.KEY_ISO_Left_Tab or is_shift else 1)
-            return True
-
         if is_ctrl and keyval in (Gdk.KEY_s, Gdk.KEY_S) and self.current_filter == "clipboard":
             item = self._selected_item()
             if item and item.get("kind") == "clip":
@@ -4534,6 +4569,15 @@ class SpotlightWindow:
         if keyval in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab) and not is_ctrl:
             if self.assigning_key:
                 return True
+            step = -1 if keyval == Gdk.KEY_ISO_Left_Tab or is_shift else 1
+            # Nothing typed: walk the modes. Typed text still completes a name,
+            # sets a quick key, or changes the clipboard kind.
+            if not self.entry.get_text():
+                self.cycle_mode(step)
+                return True
+            if self.current_filter == "clipboard":
+                self.cycle_clip_kind(step)
+                return True
             if self.ghost_text:
                 self.complete_ghost()
                 return True
@@ -4541,11 +4585,7 @@ class SpotlightWindow:
             if item and item.get("action_id") and self.current_filter in ("all", "actions"):
                 self.start_assigning(item)
                 return True
-            order = self.FILTER_ORDER
-            current = "actions" if self.current_filter == "windows" else self.current_filter
-            step = -1 if keyval == Gdk.KEY_ISO_Left_Tab or is_shift else 1
-            nxt = order[(order.index(current) + step) % len(order)]
-            self.toggle_filter(nxt if nxt != "all" else self.current_filter)
+            self.cycle_mode(step)
             return True
 
         if is_ctrl and keyval in (Gdk.KEY_c, Gdk.KEY_C):
@@ -4630,10 +4670,12 @@ class SpotlightWindow:
         self._entry_repaint_id = None
         if not self.win.get_visible():
             return False
-        self.entry.queue_draw()
+        # Flip a 0.002 background change so GSK damages the whole capsule.
+        if self.pill_box.has_css_class("glyph-clear"):
+            self.pill_box.remove_css_class("glyph-clear")
+        else:
+            self.pill_box.add_css_class("glyph-clear")
         self.pill_box.queue_draw()
-        self.center_box.queue_draw()
-        self.win.queue_draw()
         return False
 
     def start_async_google_suggestions(self, web_query, gen):
@@ -4842,88 +4884,69 @@ class SpotlightWindow:
         spawn_detached(["xdg-open", path])
         self.hide()
 
-    @staticmethod
-    def _ease_out_expo(t):
-        """Spotlight-like settle: fast start, soft landing."""
-        if t >= 1.0:
-            return 1.0
-        return 1.0 - math.pow(2.0, -10.0 * t)
+    # Long enough to read as a fade, short enough to stay out of the way.
+    OPEN_US = 240_000
+    CLOSE_US = 180_000
 
     @staticmethod
     def _ease_out_cubic(t):
-        return 1.0 - math.pow(1.0 - t, 3)
+        return 1.0 - (1.0 - t) ** 3
 
-    def _capture_anim_from_current(self):
-        """Seed start_* from live widget state so reverse mid-flight stays smooth."""
-        try:
-            self.start_opacity = float(self.win.get_opacity())
-        except Exception:
-            self.start_opacity = 0.0
-        self.start_margin = int(self.center_box.get_margin_top())
-
-    def start_fade_in(self):
-        self._capture_anim_from_current()
-        self.target_opacity = 1.0
-        self.target_margin = self.margin_rest
-        self.anim_duration_us = self.anim_open_duration_us
-        self.anim_state = "fade_in"
-        self.anim_start_us = 0
-        if self.tick_cb_id is None:
-            self.tick_cb_id = self.win.add_tick_callback(self.on_anim_tick)
-
-    def start_fade_out(self):
-        if not self.win.get_visible():
-            return
-        self._capture_anim_from_current()
-        self.target_opacity = 0.0
-        self.target_margin = self.margin_hidden
-        self.anim_duration_us = self.anim_close_duration_us
-        self.anim_state = "fade_out"
-        self.anim_start_us = 0
-        if self.tick_cb_id is None:
-            self.tick_cb_id = self.win.add_tick_callback(self.on_anim_tick)
-
-    def on_anim_tick(self, widget, frame_clock):
-        now_us = frame_clock.get_frame_time()
-        if self.anim_start_us == 0:
-            self.anim_start_us = now_us
-
-        elapsed = now_us - self.anim_start_us
-        progress = min(1.0, elapsed / max(1, self.anim_duration_us))
-
-        if self.anim_state == "fade_in":
-            eased = self._ease_out_expo(progress)
-            opacity = self.start_opacity + (self.target_opacity - self.start_opacity) * eased
-            margin = self.start_margin + (self.target_margin - self.start_margin) * eased
-            self.win.set_opacity(max(0.0, min(1.0, opacity)))
-            self.center_box.set_margin_top(int(round(margin)))
-            # Subtle scale feel via center_box opacity lag (content settles after chrome)
-            self.center_box.set_opacity(min(1.0, 0.55 + 0.45 * eased))
-            if progress >= 1.0:
-                self.win.set_opacity(1.0)
-                self.center_box.set_opacity(1.0)
-                self.center_box.set_margin_top(self.margin_rest)
+    def _start_fade(self, target):
+        """Fade the bar where it already sits, so the blur stays under the glass."""
+        self._fade_start = float(self.center_box.get_opacity())
+        self._fade_target = float(target)
+        self._fade_t0 = 0
+        if abs(self._fade_target - self._fade_start) < 0.004:
+            self.center_box.set_opacity(self._fade_target)
+            if self._fade_target < 0.5:
+                self.anim_state = "fade_out"
+                self._finish_close()
+            else:
                 self.anim_state = "open"
-                self.tick_cb_id = None
-                return GLib.SOURCE_REMOVE
+                self._schedule_blur()
+            return
+        self.anim_state = "fade_in" if self._fade_target > self._fade_start else "fade_out"
+        if self._fade_tick_id is None:
+            self._fade_tick_id = self.win.add_tick_callback(self._on_fade_tick)
 
-        elif self.anim_state == "fade_out":
-            eased = self._ease_out_cubic(progress)
-            opacity = self.start_opacity + (self.target_opacity - self.start_opacity) * eased
-            margin = self.start_margin + (self.target_margin - self.start_margin) * eased
-            self.win.set_opacity(max(0.0, min(1.0, opacity)))
-            self.center_box.set_margin_top(int(round(margin)))
-            self.center_box.set_opacity(max(0.0, 1.0 - eased * 0.35))
-            if progress >= 1.0:
-                self.win.set_opacity(0.0)
-                self.center_box.set_opacity(1.0)
-                self.center_box.set_margin_top(self.margin_rest)
-                self.win.set_visible(False)
-                self.anim_state = "closed"
-                self.tick_cb_id = None
-                return GLib.SOURCE_REMOVE
+    def _on_fade_tick(self, _widget, frame_clock):
+        now = frame_clock.get_frame_time()
+        if self._fade_t0 == 0:
+            self._fade_t0 = now
+        duration = self.OPEN_US if self._fade_target > self._fade_start else self.CLOSE_US
+        t = min(1.0, (now - self._fade_t0) / max(1, duration))
+        opacity = self._fade_start + (self._fade_target - self._fade_start) * self._ease_out_cubic(t)
+        self.center_box.set_opacity(opacity)
+        if t < 1.0:
+            return GLib.SOURCE_CONTINUE
+        self.center_box.set_opacity(self._fade_target)
+        self._fade_tick_id = None
+        if self.anim_state == "fade_out":
+            self._finish_close()
+        else:
+            self.anim_state = "open"
+            self._schedule_blur()
+        return GLib.SOURCE_REMOVE
 
-        return GLib.SOURCE_CONTINUE
+    def _snap_results_closed(self):
+        """Drop the results panel without animating its height."""
+        self.revealer.set_transition_duration(0)
+        self.dismiss_results()
+
+        def restore():
+            self.revealer.set_transition_duration(160)
+            return False
+
+        GLib.idle_add(restore)
+
+    def _finish_close(self):
+        if self.anim_state != "fade_out":
+            return
+        self.win.set_visible(False)
+        self.anim_state = "closed"
+        self.center_box.set_opacity(0.0)
+        self._snap_results_closed()
 
     def show(self):
         self.check_and_reload_applications()
@@ -4934,9 +4957,6 @@ class SpotlightWindow:
         if self.debounce_timer_id is not None:
             GLib.source_remove(self.debounce_timer_id)
             self.debounce_timer_id = None
-        if self._buttons_reveal_timer is not None:
-            GLib.source_remove(self._buttons_reveal_timer)
-            self._buttons_reveal_timer = None
         self.fling_scroller.stop_fling()
         self.smooth_scroller.stop()
         self.browse_dir = None
@@ -4950,35 +4970,25 @@ class SpotlightWindow:
         self.set_ghost("")
         self.preview_box.set_visible(False)
         self.results_panel.set_size_request(750, -1)
-        self.dismiss_results()
+        self._snap_results_closed()
 
-        # Reset scrolled position to top (clear any rubber-band offset)
         vadj = self.scrolled.get_vadjustment()
         vadj.set_value(0.0)
         self.spring_scroller.sync_from_adj()
 
-        # Reset buttons revealer to unrevealed, then reveal for organic slide-out
-        self.buttons_revealer.set_reveal_child(False)
+        self.center_box.set_margin_top(self.margin_rest)
+        self.win.set_opacity(1.0)
+        if not self.win.get_visible():
+            self.center_box.set_opacity(0.0)
         Gtk4LayerShell.set_keyboard_mode(self.win, Gtk4LayerShell.KeyboardMode.EXCLUSIVE)
-        self.win.set_opacity(0.0)
-        self.center_box.set_opacity(0.55)
-        self.center_box.set_margin_top(self.margin_hidden)
         self.win.set_visible(True)
         self.win.present()
         self.entry.grab_focus()
-
-        # Start fade in and slide out buttons slightly after chrome appears
-        self.start_fade_in()
-
-        def reveal_buttons():
-            self._buttons_reveal_timer = None
-            self.buttons_revealer.set_reveal_child(True)
-            return False
-
-        self._buttons_reveal_timer = GLib.timeout_add(40, reveal_buttons)
+        self._schedule_blur()
+        self._start_fade(1.0)
 
     def hide(self):
-        if self.anim_state == "fade_out":
+        if self.anim_state == "fade_out" or not self.win.get_visible():
             return
         self.hide_context_menu()
         self.search_generation += 1
@@ -4986,25 +4996,12 @@ class SpotlightWindow:
         if self.debounce_timer_id is not None:
             GLib.source_remove(self.debounce_timer_id)
             self.debounce_timer_id = None
-        if self._buttons_reveal_timer is not None:
-            GLib.source_remove(self._buttons_reveal_timer)
-            self._buttons_reveal_timer = None
         self.fling_scroller.stop_fling()
         self.smooth_scroller.stop()
-        # Collapse panels first so close feels like Spotlight packing away
-        self.buttons_revealer.set_transition_duration(140)
-        self.revealer.set_transition_duration(120)
-        self.buttons_revealer.set_reveal_child(False)
-        self.dismiss_results()
+        # Leave the results panel in place and fade the whole bar. Collapsing
+        # it here reflowed the fullscreen window for the whole close.
         Gtk4LayerShell.set_keyboard_mode(self.win, Gtk4LayerShell.KeyboardMode.NONE)
-        self.start_fade_out()
-        # Restore revealer durations for next open
-        GLib.timeout_add(180, self._restore_revealer_durations)
-
-    def _restore_revealer_durations(self):
-        self.buttons_revealer.set_transition_duration(200)
-        self.revealer.set_transition_duration(160)
-        return False
+        self._start_fade(0.0)
 
     def toggle(self):
         if self.win.get_visible() and self.anim_state != "fade_out":
