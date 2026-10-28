@@ -486,9 +486,62 @@ mv "$n.part" "$n"
         words = self._sidecar(path, ".txt") if entry["kind"] == "image" else None
         entry["words"] = words or ""
         entry["search"] = " ".join(
-            (entry["title"], entry["text"], entry["src"], entry["words"], "screenshot" if entry["screenshot"] else "")
+            (entry["title"], entry["text"], " ".join(entry["paths"]), entry["src"], entry["words"],
+             "screenshot" if entry["screenshot"] else "")
         ).lower()
         return entry
+
+    @staticmethod
+    def _as_files(info, paths, text):
+        names = [os.path.basename(p.rstrip("/")) or p for p in paths]
+        if len(names) == 1:
+            title = names[0]
+        else:
+            title = f"{len(names)} files: " + ", ".join(names[:3]) + ("…" if len(names) > 3 else "")
+        info.update(kind="files", paths=paths, title=title, text=text)
+        return info
+
+    @staticmethod
+    def paths_in_text(text):
+        """Local files when the whole copy is paths: file:// lines, or paths that exist.
+
+        Returns the paths, or None when the copy is ordinary text. Every line has
+        to be a path, so a note that only mentions a file stays text.
+        """
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines or len(lines) > 20:
+            return None
+        paths = []
+        for line in lines:
+            path = ClipboardHistory._line_path(line)
+            if not path:
+                return None
+            paths.append(path)
+        if any(line.lower().startswith("file://") for line in lines):
+            return paths
+        if all(os.path.exists(path) for path in paths):
+            return paths
+        return None
+
+    @staticmethod
+    def _line_path(line):
+        """A local path named by one line, or None."""
+        if len(line) > 4096 or "\x00" in line:
+            return None
+        if line.lower().startswith("file://"):
+            parsed = urllib.parse.urlparse(line)
+            if parsed.scheme.lower() != "file":
+                return None
+            if parsed.netloc and parsed.netloc.lower() != "localhost":
+                return None
+            path = urllib.parse.unquote(parsed.path)
+            return path if path.startswith("/") else None
+        if line.startswith("~"):
+            path = os.path.expanduser(line)
+            return path if path.startswith("/") and os.path.exists(path) else None
+        if line.startswith("/") and not line.startswith("//") and os.path.exists(line):
+            return line
+        return None
 
     def _describe(self, path, size):
         try:
@@ -523,12 +576,14 @@ mv "$n.part" "$n"
             paths = [urllib.parse.unquote(urllib.parse.urlparse(line.strip()).path)
                      for line in text.splitlines() if line.strip().startswith("file://")]
             if paths:
-                names = [os.path.basename(p.rstrip("/")) or p for p in paths]
-                title = names[0] if len(names) == 1 else f"{len(names)} files: " + ", ".join(names[:3]) + ("…" if len(names) > 3 else "")
-                info.update(kind="files", paths=paths, title=title, text="\n".join(paths))
-                return info
+                return self._as_files(info, paths, "\n".join(paths))
             mime = info["mime"] = "text/plain"
         one = text.strip()
+        paths = self.paths_in_text(one)
+        if paths:
+            # Copied as ordinary text, so paste still pastes the text. The paths
+            # let the preview open the file or its folder.
+            return self._as_files(info, paths, text)
         if "\n" not in one and self._LINK_RE.match(one):
             kind = "link"
         elif self._COLOR_RE.match(one):
@@ -2575,6 +2630,19 @@ class SpotlightWindow:
         self.preview_box.append(buttons)
 
         clip = lambda: self.preview_item["clip"]
+        self.preview_clip_file_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        for label, where in (("Open", "open"), ("Open location", "location")):
+            button = Gtk.Button(label=label)
+            button.add_css_class("preview-btn")
+            button.set_can_focus(False)
+            button.connect(
+                "clicked",
+                lambda _b, w=where: self.preview_item and self.preview_item.get("kind") == "clip" and self.open_clip_target(clip(), w),
+            )
+            self.preview_clip_file_buttons.append(button)
+        self.preview_clip_file_buttons.set_visible(False)
+        self.preview_box.append(self.preview_clip_file_buttons)
+
         self.preview_clip_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.preview_star_button = None
         for label, fn in (
@@ -3193,8 +3261,9 @@ class SpotlightWindow:
         gen = self.search_generation
         self._schedule_surface_repaint()
         self.set_ghost("")
-        # While browsing a folder, one click selects (and previews), two open.
-        self.list_box.set_activate_on_single_click(not self.browse_dir)
+        # Folder browsing and the clipboard: one click selects and previews.
+        # Enter or a double-click runs the row.
+        self.list_box.set_activate_on_single_click(not self.browse_dir and self.current_filter != "clipboard")
 
         if self.debounce_timer_id is not None:
             GLib.source_remove(self.debounce_timer_id)
@@ -3246,7 +3315,7 @@ class SpotlightWindow:
             self.render_results([r[1] for r in results])
         elif mode == "clipboard":
             paste = "⇧⏎ paste" if shutil.which("wtype") else "⇧⏎ paste (needs wtype)"
-            self.set_footer(["⏎ copy", paste, "Ctrl S star", "Tab kind", "Delete forget it"], "Ctrl 4 show everything")
+            self.set_footer(["⏎ or double-click copy", paste, "Ctrl S star", "Tab kind", "Delete forget it"], "Ctrl 4 show everything")
             items = self.get_clipboard_items(query.lower())
             if not items:
                 empty = {
@@ -3615,7 +3684,7 @@ class SpotlightWindow:
             "clip": clip,
             "title": clip["title"],
             "subtitle": self._clip_subtitle(clip),
-            "icon": self._CLIP_ICONS[clip["kind"]],
+            "icon": self._clip_icon(clip),
             "thumb": clip["path"] if clip["kind"] == "image" else None,
             "swatch": clip["title"] if clip["kind"] == "color" else None,
             "hint": "★" if clip["starred"] else None,
@@ -3629,8 +3698,12 @@ class SpotlightWindow:
             parts = ["Screenshot" if clip["screenshot"] else "Image",
                      clip["mime"].split("/")[-1].upper(), GLib.format_size(clip["size"])]
         elif kind == "files":
-            count = len(clip["paths"])
-            parts = ["Files" if count > 1 else "File", "pastes as files"]
+            label = self._paths_label(clip["paths"])
+            if clip["mime"] == "text/uri-list":
+                parts = [label, "pastes as files"]
+            else:
+                parent = os.path.basename(os.path.dirname(clip["paths"][0].rstrip("/")))
+                parts = [label] + ([parent] if parent else [])
         elif kind == "link":
             host = urllib.parse.urlparse(clip["title"] if "://" in clip["title"] else "https://" + clip["title"]).hostname
             parts = ["Link"] + ([host] if host else [])
@@ -3655,6 +3728,59 @@ class SpotlightWindow:
             if info:
                 return info.get_name()
         return window_class.rsplit(".", 1)[-1].capitalize()
+
+    def _clip_icon(self, clip):
+        if clip["kind"] == "files" and len(clip["paths"]) == 1 and not os.path.isdir(clip["paths"][0]):
+            return "text-x-generic"
+        return self._CLIP_ICONS[clip["kind"]]
+
+    @staticmethod
+    def _paths_label(paths):
+        if len(paths) != 1:
+            return "Files"
+        return "Folder" if os.path.isdir(paths[0]) else "File"
+
+    def _files_preview_meta(self, paths):
+        """Kind and size lines for a copied file or folder."""
+        if len(paths) != 1:
+            return "Files", f"{len(paths)} files"
+        path = paths[0]
+        if os.path.isdir(path):
+            try:
+                count = len(os.listdir(path))
+            except OSError:
+                return "Folder", "Folder"
+            return "Folder", f"{count} item{'s' if count != 1 else ''}"
+        if os.path.isfile(path):
+            try:
+                return "File", GLib.format_size(os.path.getsize(path))
+            except OSError:
+                return "File", "File"
+        return "File", "Missing"
+
+    def open_clip_target(self, clip, where):
+        """Open a copied file, or reveal it in its folder."""
+        paths = [path for path in (clip.get("paths") or []) if path]
+        if not paths:
+            return
+        existing = [path for path in paths if os.path.exists(path)]
+        if where == "location":
+            if existing:
+                self.show_in_folder(existing[0])
+                return
+            parent = os.path.dirname(paths[0].rstrip("/")) or paths[0]
+            if os.path.isdir(parent):
+                spawn_detached(["xdg-open", parent])
+                self.hide()
+                return
+            self._notify("Can't find it", paths[0])
+            return
+        if not existing:
+            self._notify("Can't find it", paths[0])
+            return
+        for path in existing[:8]:
+            spawn_detached(["xdg-open", path])
+        self.hide()
 
     def paste_clip(self, clip):
         self.hide()
@@ -3908,6 +4034,7 @@ class SpotlightWindow:
         clip = what == "clip"
         self.preview_file_buttons.set_visible(not clip)
         self.preview_clip_buttons.set_visible(clip)
+        self.preview_clip_file_buttons.set_visible(False)
         for key, text in zip(self.preview_keys, ("Kind", "Size", "Copied" if clip else "Changed")):
             key.set_text(text)
         self.preview_picture.set_content_fit(Gtk.ContentFit.CONTAIN if clip else Gtk.ContentFit.COVER)
@@ -3924,6 +4051,7 @@ class SpotlightWindow:
         self.preview_box.set_visible(True)
         self.preview_star_button.set_label("Unstar" if clip["starred"] else "Star")
         self.preview_save_button.set_visible(clip["kind"] in ("image", "text", "link"))
+        self.preview_clip_file_buttons.set_visible(bool(clip.get("paths")))
         self.preview_name.set_text(clip["title"] if clip["kind"] != "text" else (clip["title"][:80] or "Text"))
         kinds = {"image": "Screenshot" if clip["screenshot"] else "Image", "files": "Files", "link": "Link", "color": "Color", "text": "Text"}
         kind = kinds[clip["kind"]]
@@ -3931,7 +4059,7 @@ class SpotlightWindow:
             kind += ", " + clip["mime"].split("/")[-1].upper()
             size = GLib.format_size(clip["size"])
         elif clip["kind"] == "files":
-            size = f"{len(clip['paths'])} file{'s' if len(clip['paths']) != 1 else ''}"
+            kind, size = self._files_preview_meta(clip["paths"])
         else:
             size = f"{len(clip['text'])} characters"
         self.preview_kind.set_text(kind)
