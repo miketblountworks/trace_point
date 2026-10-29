@@ -823,6 +823,90 @@ def save_settings(data):
         pass
 
 
+RECENT_LIMIT = 8
+RECENT_PATH = os.path.join(
+    os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
+    "trace_point",
+    "recents.json",
+)
+
+
+def recent_key(entry):
+    """Identity for one recent launch. None when the entry is not usable."""
+    if not isinstance(entry, dict):
+        return None
+    kind = entry.get("kind")
+    if kind == "app":
+        name = entry.get("name")
+        exec_cmd = entry.get("exec")
+        if not isinstance(name, str) or not name.strip():
+            return None
+        if not isinstance(exec_cmd, str) or not exec_cmd.strip():
+            return None
+        path = entry.get("path") if isinstance(entry.get("path"), str) else ""
+        return ("app", path or name.strip(), exec_cmd.strip())
+    if kind == "file":
+        path = entry.get("path")
+        if isinstance(path, str) and path.startswith("/"):
+            return ("file", path)
+        return None
+    if kind == "command":
+        prefix = entry.get("prefix")
+        command = entry.get("command")
+        if prefix in ("run", "term") and isinstance(command, str) and command.strip():
+            return ("command", prefix, command.strip())
+        return None
+    if kind == "web":
+        query = entry.get("query")
+        if isinstance(query, str) and query.strip():
+            return ("web", query.strip())
+        return None
+    if kind == "action":
+        action_id = entry.get("id")
+        if isinstance(action_id, str) and action_id:
+            return ("action", action_id)
+        return None
+    return None
+
+
+def load_recents():
+    try:
+        with open(RECENT_PATH, encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(saved, list):
+        return []
+    items = []
+    seen = set()
+    for entry in saved:
+        key = recent_key(entry)
+        if key is None or key in seen:
+            continue
+        seen.add(key)
+        items.append(entry)
+        if len(items) >= RECENT_LIMIT:
+            break
+    return items
+
+
+def remember_recent(entry):
+    """Move this launch to the front of the list shown on an empty search."""
+    key = recent_key(entry)
+    if key is None:
+        return
+    items = [item for item in load_recents() if recent_key(item) != key]
+    items.insert(0, entry)
+    del items[RECENT_LIMIT:]
+    try:
+        os.makedirs(os.path.dirname(RECENT_PATH), exist_ok=True)
+        with open(RECENT_PATH, "w", encoding="utf-8") as f:
+            json.dump(items, f, indent=2)
+            f.write("\n")
+    except OSError:
+        pass
+
+
 # run: stays in the background. term: opens the command in a terminal.
 _TYPED_COMMANDS = {"run": "background", "term": "terminal"}
 _TYPED_HINTS = {
@@ -848,6 +932,186 @@ def parse_typed_command(raw_text):
     elif rest.startswith('"'):
         rest = rest[1:]
     return prefix, rest
+
+
+def command_body(raw_text):
+    """Inner run:/term: text, keeping a trailing space.
+
+    The space means the command word is finished and the next word is next.
+    """
+    text = raw_text.lstrip()
+    prefix, sep, rest = text.partition(":")
+    if not sep or prefix.lower() not in _TYPED_COMMANDS:
+        return ""
+    rest = rest.lstrip()
+    if rest.startswith('"'):
+        rest = rest[1:]
+        if rest.endswith('"'):
+            rest = rest[:-1]
+        return rest
+    return rest
+
+
+def command_cursor(raw_text):
+    """Where the next command character goes, just before a closing quote."""
+    lead = len(raw_text) - len(raw_text.lstrip())
+    text = raw_text.lstrip()
+    prefix, sep, rest = text.partition(":")
+    if not sep:
+        return len(raw_text)
+    gap = len(rest) - len(rest.lstrip())
+    rest = rest.lstrip()
+    base = lead + len(prefix) + 1 + gap
+    if rest.startswith('"'):
+        inner = rest[1:]
+        if inner.endswith('"'):
+            inner = inner[:-1]
+        return base + 1 + len(inner)
+    return base + len(rest)
+
+
+def format_typed_command(raw_text, command):
+    """Put command back into the run:/term: line the user was typing."""
+    text = raw_text.lstrip()
+    prefix, sep, rest = text.partition(":")
+    if not sep:
+        return raw_text, len(raw_text)
+    quoted = rest.lstrip().startswith('"')
+    if quoted:
+        shown = f'{prefix}: "{command}"'
+        cursor = len(prefix) + 3 + len(command)
+    else:
+        shown = f"{prefix}: {command}"
+        cursor = len(shown)
+    return shown, cursor
+
+
+# Names a shell runs without a file on PATH. Included so term: can finish them.
+_SHELL_BUILTINS = frozenset({
+    "alias", "bg", "cd", "command", "echo", "eval", "exec", "exit", "export",
+    "false", "fg", "hash", "history", "jobs", "kill", "popd", "printf", "pushd",
+    "pwd", "read", "set", "source", "test", "true", "type", "ulimit", "umask",
+    "unset", "wait",
+})
+_COMMAND_CACHE = {"path": None, "names": ()}
+
+
+def executable_names():
+    """Executable file names on PATH, plus shell builtins. Cached until PATH changes."""
+    path = os.environ.get("PATH", "")
+    if _COMMAND_CACHE["path"] == path:
+        return _COMMAND_CACHE["names"]
+    names = set(_SHELL_BUILTINS)
+    for directory in path.split(":"):
+        if not directory:
+            continue
+        try:
+            scanned = os.scandir(directory)
+        except OSError:
+            continue
+        with scanned:
+            for entry in scanned:
+                if entry.name.startswith("."):
+                    continue
+                try:
+                    if not entry.is_file(follow_symlinks=True):
+                        continue
+                    if os.access(entry.path, os.X_OK):
+                        names.add(entry.name)
+                except OSError:
+                    continue
+    ordered = tuple(sorted(names))
+    _COMMAND_CACHE["path"] = path
+    _COMMAND_CACHE["names"] = ordered
+    return ordered
+
+
+def _path_token(token):
+    return token.startswith(("/", "~/", "./", "../")) or ("/" in token and not token.startswith("-"))
+
+
+def path_completions(token, home, limit=8):
+    """Finish a path token. Directories come back with a trailing slash."""
+    expanded = os.path.expanduser(token)
+    if token.endswith("/"):
+        directory, partial = expanded, ""
+    else:
+        directory = os.path.dirname(expanded) or "."
+        partial = os.path.basename(expanded)
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return []
+    found = []
+    for name in sorted(entries):
+        if name.startswith(".") and not partial.startswith("."):
+            continue
+        if not name.startswith(partial):
+            continue
+        full = os.path.join(directory, name)
+        shown = full
+        if token.startswith("~") and (full.startswith(home.rstrip("/") + os.sep) or full.rstrip("/") == home.rstrip("/")):
+            shown = "~" + full[len(home.rstrip("/")):]
+        if os.path.isdir(full) and not shown.endswith("/"):
+            shown += "/"
+        found.append(shown)
+        if len(found) >= limit:
+            break
+    return found
+
+
+def command_completions(body, names, recents, home, limit=8):
+    """Lines Tab can insert for the command typed so far.
+
+    The first word completes to a program or a recent command. A later word
+    completes to a path, or to a recent command that starts the same way.
+    A bare program name gains a trailing space so arguments can follow.
+    """
+    results = []
+
+    def add(text):
+        if text and text != body and text not in results:
+            results.append(text)
+
+    if body.endswith(" "):
+        head, token, first = body, "", False
+    else:
+        head, sep, token = body.rpartition(" ")
+        if sep:
+            head, first = head + sep, False
+        else:
+            head, first = "", True
+    if first and not token:
+        for recent in recents:
+            add(recent)
+        return results[:limit]
+    if first:
+        for recent in recents:
+            if recent.startswith(token):
+                add(recent)
+        for name in names:
+            if name.startswith(token) and name != token:
+                add(name + " ")
+        return results[:limit]
+    if _path_token(token):
+        for path in path_completions(token, home, limit):
+            add(head + path)
+        return results[:limit]
+    for recent in recents:
+        if recent.startswith(body):
+            add(recent)
+    return results[:limit]
+
+
+def recent_command_texts():
+    seen = []
+    for entry in load_recents():
+        if entry.get("kind") != "command":
+            continue
+        command = entry.get("command", "").strip()
+        if command and command not in seen:
+            seen.append(command)
+    return seen
 
 
 def terminal_argv(command, cwd):
@@ -4010,6 +4274,8 @@ class SpotlightWindow:
         self.search_generation += 1
         gen = self.search_generation
         self._schedule_surface_repaint()
+        if getattr(self, "_suppress_search", False):
+            return
         self.set_ghost("")
         # Folder browsing and the clipboard: one click selects and previews.
         # Enter or a double-click runs the row.
@@ -4058,7 +4324,7 @@ class SpotlightWindow:
         if mode == "all":
             self.badge_box.set_visible(False)
             if not raw_text:
-                self.dismiss_results()
+                self.render_recents()
                 return
             if raw_text.startswith(":"):
                 self.render_commands(raw_text)
@@ -4343,27 +4609,155 @@ class SpotlightWindow:
             },
         ])
 
+    def render_recents(self):
+        """What was opened or run, shown when the search field is empty."""
+        items = []
+        for entry in load_recents():
+            row = self._recent_row(entry)
+            if row is not None:
+                items.append(row)
+        if not items:
+            self.dismiss_results()
+            return
+        self.set_footer(["↑ ↓ move", "⏎ open"], "Esc close")
+        self.render_results([{"kind": "header", "title": "Recent"}] + items)
+
+    def _recent_row(self, entry):
+        kind = entry.get("kind")
+        if kind == "app":
+            return {
+                "title": entry["name"].strip(),
+                "subtitle": (entry.get("comment") or "Application").strip() or "Application",
+                "icon": entry.get("icon") or "application-x-executable",
+                "action": lambda e=dict(entry): self._open_recent_app(e),
+            }
+        if kind == "file":
+            path = entry["path"]
+            if not os.path.exists(path):
+                return None
+            return self.make_file_item(path, os.path.isdir(path))
+        if kind == "command":
+            prefix, command = entry["prefix"], entry["command"].strip()
+            return {
+                "title": f'{prefix}: "{command}"',
+                "subtitle": "Opens in a terminal" if prefix == "term" else "Runs in the background",
+                "icon": "utilities-terminal",
+                "action": lambda p=prefix, c=command: self._execute_typed(p, c),
+            }
+        if kind == "web":
+            query = entry["query"].strip()
+            return {
+                "title": query,
+                "subtitle": "Search the web",
+                "icon_file": os.path.join(ICONS_DIR, "google.svg"),
+                "action": lambda q=query: self.open_web_search(q),
+            }
+        if kind == "action":
+            act = next((a for a in self.get_actions() if a["id"] == entry.get("id")), None)
+            if act is None or act.get("power") or act.get("keep_open"):
+                return None
+            return {
+                "title": act["title"],
+                "subtitle": act["subtitle"],
+                "icon": act["icon"],
+                "action": lambda a=act: self.run_action(a),
+            }
+        return None
+
+    def _open_recent_app(self, entry):
+        app = next((a for a in self.apps if entry.get("path") and a.get("path") == entry["path"]), None)
+        if app is None:
+            if spawn_detached(entry["exec"], shell=True) is not None:
+                remember_recent(entry)
+            self.hide()
+            return
+        default = re.sub(r"%[fFuUdDnNickvm]", "", app["exec"]).strip()
+        if entry.get("exec") and entry["exec"] != default:
+            self.launch_app(app, entry["exec"])
+        else:
+            self.launch_app(app)
+
     def render_typed_command(self, prefix, command):
-        """run: runs in the background. term: opens the command in a terminal."""
+        """run: runs in the background. term: opens the command in a terminal.
+
+        Matching programs, recent commands, and paths sit under that row.
+        Tab writes the selected one into the field.
+        """
+        raw_text = self.entry.get_text()
+        body = command_body(raw_text)
+        home = os.path.expanduser("~")
+        completions = command_completions(body, executable_names(), recent_command_texts(), home)
         command = command.strip()
+        items = []
         if command:
             in_terminal = prefix == "term"
-            item = {
+            items.append({
                 "title": f'{prefix}: "{command}"',
                 "subtitle": "Opens in a terminal" if in_terminal else "Runs in the background",
                 "icon": "utilities-terminal",
                 "action": lambda p=prefix, c=command: self._execute_typed(p, c),
-            }
-            self.set_footer(["⏎ run"], "Esc close")
+            })
         else:
-            item = {
+            items.append({
                 "title": _TYPED_HINTS[prefix],
                 "subtitle": "Type a command between the quotes, then press Enter",
                 "icon": "utilities-terminal",
                 "action": lambda p=prefix: self._arm_typed_entry(p),
-            }
-            self.set_footer(["Type a command", "⏎ run"], "Esc close")
-        self.render_results([item])
+            })
+        if completions:
+            items.append({"kind": "header", "title": "Commands"})
+            for completion in completions:
+                items.append(self._completion_row(prefix, completion))
+        self.set_footer(["⏎ run", "Tab complete"] if completions else ["⏎ run"], "Esc close")
+        self.render_results(items)
+        if completions:
+            GLib.idle_add(self._ghost_command, raw_text, completions[0])
+        else:
+            self.set_ghost("")
+
+    def _completion_row(self, prefix, completion):
+        shown = completion.rstrip()
+        expanded = os.path.expanduser(shown)
+        if shown.endswith("/") or (os.path.isdir(expanded) and "/" in shown):
+            subtitle, icon = "Folder", "folder"
+        elif "/" in shown and os.path.isfile(expanded):
+            subtitle, icon = "File", self.get_file_icon(expanded, False)
+        elif " " in shown:
+            subtitle, icon = "Recent", "utilities-terminal"
+        else:
+            subtitle, icon = "Command", "utilities-terminal"
+        return {
+            "title": shown,
+            "subtitle": subtitle,
+            "icon": icon,
+            "insert": completion,
+            "action": lambda p=prefix, c=shown: self._execute_typed(p, c),
+        }
+
+    def _ghost_command(self, raw_text, completion):
+        """Gray the rest of the first completion at the cursor."""
+        if raw_text != self.entry.get_text():
+            return False
+        body = command_body(raw_text)
+        if not completion.startswith(body) or len(completion) <= len(body):
+            return False
+        at = command_cursor(raw_text)
+        if self.entry.get_position() != at:
+            return False
+        self.set_ghost(completion[len(body):], at=at)
+        return False
+
+    def _accept_command_completion(self):
+        """Tab writes a completion in place of the unfinished command."""
+        item = self._selected_item()
+        insert = item.get("insert") if item else None
+        if not insert:
+            insert = next((row.get("insert") for row in self.results_data if row.get("insert")), None)
+        if not insert:
+            return
+        text, cursor = format_typed_command(self.entry.get_text(), insert)
+        self.entry.set_text(text)
+        self.entry.set_position(cursor)
 
     def _arm_typed_entry(self, prefix):
         """Put the cursor between the quotes so the command can be typed."""
@@ -4391,9 +4785,11 @@ class SpotlightWindow:
             argv = terminal_argv(command, home)
             if argv is None or spawn_detached(argv, cwd=home) is None:
                 self._notify("Couldn't open a terminal", command)
-            return
-        if spawn_detached(command, shell=True, cwd=home) is None:
+                return
+        elif spawn_detached(command, shell=True, cwd=home) is None:
             self._notify("Couldn't run that", command)
+            return
+        remember_recent({"kind": "command", "prefix": prefix, "command": command[:500]})
 
     def _switch_to_files(self, rest):
         """The old "fs:" prefix now just opens the Files view."""
@@ -4418,18 +4814,23 @@ class SpotlightWindow:
         return False
 
     def _on_cursor_moved(self, *_args):
-        if self.ghost_text and self.entry.get_position() != len(self.entry.get_text()):
+        if self.ghost_text and self.entry.get_position() != getattr(self, "_ghost_anchor", None):
             self.set_ghost("")
 
-    def set_ghost(self, completion):
+    def set_ghost(self, completion, at=None):
         self.ghost_text = completion
         if not completion:
+            self._ghost_anchor = None
             self.ghost_label.set_visible(False)
             return
-        typed_w = self.entry.create_pango_layout(self.entry.get_text()).get_pixel_size()[0]
+        if at is None:
+            at = len(self.entry.get_text())
+        self._ghost_anchor = at
+        typed_w = self.entry.create_pango_layout(self.entry.get_text()[:at]).get_pixel_size()[0]
         ghost_w = self.entry.create_pango_layout(completion).get_pixel_size()[0]
         if typed_w + ghost_w > self.entry.get_width() - 8:
             self.ghost_text = ""
+            self._ghost_anchor = None
             self.ghost_label.set_visible(False)
             return
         self.ghost_label.set_text(completion)
@@ -4581,6 +4982,10 @@ class SpotlightWindow:
             return
         self.hide()
         act["fn"]()
+        # Power, lock, and sleep stay out of the empty-search list. Enter on
+        # open would run whatever is first.
+        if not act.get("power") and act.get("id") not in {"lock", "suspend"}:
+            remember_recent({"kind": "action", "id": act["id"]})
 
     def _open_window_list(self):
         self.current_filter = "actions"
@@ -5567,6 +5972,14 @@ class SpotlightWindow:
         if keyval in (Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab) and not is_ctrl:
             if self.assigning_key:
                 return True
+            if (
+                keyval == Gdk.KEY_Tab
+                and not is_shift
+                and self.current_filter == "all"
+                and parse_typed_command(self.entry.get_text()) is not None
+            ):
+                self._accept_command_completion()
+                return True
             step = -1 if keyval == Gdk.KEY_ISO_Left_Tab or is_shift else 1
             # Nothing typed: walk the modes. Typed text still completes a name,
             # sets a quick key, or changes the clipboard kind.
@@ -5633,8 +6046,19 @@ class SpotlightWindow:
 
     def launch_app(self, app, exec_cmd=None):
         cmd = re.sub(r'%[fFuUdDnNickvm]', '', exec_cmd or app["exec"]).strip()
-        spawn_detached(cmd, shell=True)
+        if not cmd:
+            return
+        spawned = spawn_detached(cmd, shell=True)
         self.hide()
+        if spawned is not None:
+            remember_recent({
+                "kind": "app",
+                "name": app.get("name") or "Application",
+                "exec": cmd[:500],
+                "icon": app.get("icon") or "application-x-executable",
+                "path": app.get("path") or "",
+                "comment": app.get("comment") or "",
+            })
 
     @staticmethod
     def get_file_icon(path, is_dir):
@@ -5720,8 +6144,10 @@ class SpotlightWindow:
 
     def open_web_search(self, query):
         url = f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}"
-        spawn_detached(["xdg-open", url])
+        spawned = spawn_detached(["xdg-open", url])
         self.hide()
+        if spawned is not None and query.strip():
+            remember_recent({"kind": "web", "query": query.strip()[:200]})
 
     def clear_results(self):
         self.spring_scroller.stop()
@@ -5879,8 +6305,10 @@ class SpotlightWindow:
         if os.path.isdir(path):
             self.browse_into(path)
             return
-        spawn_detached(["xdg-open", path])
+        spawned = spawn_detached(["xdg-open", path])
         self.hide()
+        if spawned is not None:
+            remember_recent({"kind": "file", "path": path})
 
     # Long enough to read as a fade, short enough to stay out of the way.
     OPEN_US = 240_000
@@ -5961,7 +6389,9 @@ class SpotlightWindow:
         self.assigning_key = None
         self.current_filter = "all"
         self._mark_mode_buttons()
+        self._suppress_search = True
         self.entry.set_text("")
+        self._suppress_search = False
         self.entry.set_placeholder_text("TracePoint Search")
         self.badge_box.set_visible(False)
         self.set_ghost("")
@@ -5983,6 +6413,19 @@ class SpotlightWindow:
         self.entry.grab_focus()
         self._schedule_blur()
         self._start_fade(1.0)
+        GLib.idle_add(self._show_recents_if_idle)
+
+    def _show_recents_if_idle(self):
+        """The open snap closes the panel. Fill it once the field is still empty."""
+        if (
+            self.win.get_visible()
+            and self.anim_state != "fade_out"
+            and self.current_filter == "all"
+            and not self.entry.get_text()
+            and not self.assigning_key
+        ):
+            self.render_recents()
+        return False
 
     def hide(self):
         if self.anim_state == "fade_out" or not self.win.get_visible():
