@@ -112,7 +112,7 @@ def _child_env(env=None):
     return out
 
 
-def spawn_detached(cmd, *, shell=False, env=None):
+def spawn_detached(cmd, *, shell=False, env=None, cwd=None):
     """Launch an independent process that survives TracePoint daemon death.
 
     Prefer systemd-run --user --scope so the app lives outside the service
@@ -127,11 +127,15 @@ def spawn_detached(cmd, *, shell=False, env=None):
         stderr=subprocess.DEVNULL,
         env=child_env,
         start_new_session=True,
+        cwd=cwd,
     )
     systemd_run = shutil.which("systemd-run")
     try:
         if systemd_run:
-            prefix = [systemd_run, "--user", "--scope", "--collect", "--"]
+            prefix = [systemd_run, "--user", "--scope", "--collect"]
+            if cwd:
+                prefix.append(f"--working-directory={cwd}")
+            prefix.append("--")
             if shell:
                 shell_cmd = cmd if isinstance(cmd, str) else " ".join(cmd)
                 argv = prefix + ["/bin/sh", "-c", shell_cmd]
@@ -726,13 +730,50 @@ SETTINGS_PATH = os.path.join(
 )
 # Clipboard retention choices, in hours. 24 matches the old fixed limit.
 CLIPBOARD_KEEP = (1, 6, 12, 24, 72, 168)
-DEFAULT_SETTINGS = {"blur": True, "margin_top": 160, "clipboard_hours": 24}
+# 46 matches the search pill's design alpha, so the bar looks the same until
+# the slider moves. Opacity is a percent and only replaces that glass while
+# background blur is off.
+DEFAULT_SETTINGS = {"blur": True, "opacity": 46, "margin_top": 160, "clipboard_hours": 24}
 # ":cb" is the short form of :clipboard and stays out of the command list.
 COMMANDS = (
     (":clipboard", "Clipboard history", "Everything you copied: pictures, links, files and text", "clipboard", "clipboard.svg"),
-    (":settings", "Settings", "Blur, how long copies stay, and where the bar sits", "settings", "settings.svg"),
+    (":settings", "Settings", "Blur, opacity, how long copies stay, and where the bar sits", "settings", "settings.svg"),
 )
 COMMAND_ALIASES = {":cb": ":clipboard"}
+
+
+def glass_opacity_css(percent):
+    """Backgrounds for the pill, buttons, results, and menu at this opacity.
+
+    The offsets keep the designed relationship: results a little clearer,
+    the menu a little more solid, hover a step lighter. glyph-clear stays a
+    hair off the pill color so a keystroke still damages the whole capsule.
+    """
+    alpha = max(0, min(100, int(percent))) / 100.0
+    nudge = alpha if alpha >= 0.998 else alpha + 0.002
+    hover = min(1.0, alpha + 0.09)
+    panel = max(0.0, alpha - 0.04)
+    menu = min(1.0, alpha + 0.16)
+
+    def rgba(rgb, value):
+        return f"rgba({rgb[0]}, {rgb[1]}, {rgb[2]}, {value:.3f})"
+
+    glass = (32, 36, 44)
+    panel_rgb = (28, 32, 40)
+    hover_rgb = (58, 66, 80)
+    return (
+        f".spotlight-pill {{ background-color: {rgba(glass, alpha)}; }}\n"
+        f".spotlight-pill.glyph-clear {{ background-color: {rgba(glass, nudge)}; }}\n"
+        f"button.spotlight-circle-btn {{ background-color: {rgba(glass, alpha)}; }}\n"
+        f"button.spotlight-circle-btn:hover {{ background-color: {rgba(hover_rgb, hover)}; }}\n"
+        "button.spotlight-circle-btn.active {\n"
+        "    background: rgba(0, 122, 255, 0.35);\n"
+        "    border: 1px solid #007aff;\n"
+        "    box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.50), 0 16px 36px rgba(0, 0, 0, 0.35);\n"
+        "}\n"
+        f".spotlight-results-panel {{ background-color: {rgba(panel_rgb, panel)}; }}\n"
+        f".spotlight-context-menu {{ background-color: {rgba(panel_rgb, menu)}; }}\n"
+    )
 
 
 def clipboard_keep_phrase(hours):
@@ -750,6 +791,9 @@ def load_settings():
         return data
     if isinstance(saved.get("blur"), bool):
         data["blur"] = saved["blur"]
+    opacity = saved.get("opacity")
+    if isinstance(opacity, (int, float)):
+        data["opacity"] = int(max(0, min(100, round(opacity))))
     margin = saved.get("margin_top")
     if isinstance(margin, (int, float)):
         data["margin_top"] = int(max(48, min(420, margin)))
@@ -767,6 +811,7 @@ def save_settings(data):
             json.dump(
                 {
                     "blur": bool(data["blur"]),
+                    "opacity": int(data["opacity"]),
                     "margin_top": int(data["margin_top"]),
                     "clipboard_hours": int(data["clipboard_hours"]),
                 },
@@ -776,6 +821,54 @@ def save_settings(data):
             f.write("\n")
     except OSError:
         pass
+
+
+# run: stays in the background. term: opens the command in a terminal.
+_TYPED_COMMANDS = {"run": "background", "term": "terminal"}
+_TYPED_HINTS = {
+    "run": 'run: "then type in command here"',
+    "term": 'term: "command here"',
+}
+
+
+def parse_typed_command(raw_text):
+    """Return (prefix, command) for a run: or term: line, else None.
+
+    The command is the text inside the quotes. An unquoted remainder works
+    too. An empty prefix line is still a match, so the hint can stay on screen.
+    """
+    text = raw_text.strip()
+    prefix, sep, rest = text.partition(":")
+    if not sep or prefix.lower() not in _TYPED_COMMANDS:
+        return None
+    prefix = prefix.lower()
+    rest = rest.strip()
+    if len(rest) >= 2 and rest.startswith('"') and rest.endswith('"'):
+        rest = rest[1:-1]
+    elif rest.startswith('"'):
+        rest = rest[1:]
+    return prefix, rest
+
+
+def terminal_argv(command, cwd):
+    """Argv that runs command in a terminal and leaves the window open.
+
+    kitty is the terminal this desktop opens. The others are fallbacks.
+    """
+    if shutil.which("kitty"):
+        return ["kitty", "--hold", "--directory", cwd, "sh", "-c", command]
+    if shutil.which("alacritty"):
+        script = command + '\nexec "${SHELL:-bash}"'
+        return ["alacritty", "--working-directory", cwd, "-e", "sh", "-c", script]
+    if shutil.which("ghostty"):
+        return ["ghostty", f"--working-directory={cwd}", "-e", "sh", "-c", command]
+    if shutil.which("foot"):
+        return ["foot", "--working-directory", cwd, "sh", "-c", command]
+    if shutil.which("wezterm"):
+        return ["wezterm", "start", "--cwd", cwd, "--", "sh", "-c", command]
+    if shutil.which("ptyxis"):
+        return ["ptyxis", "--working-directory", cwd, "--", "sh", "-c", command]
+    return None
 
 
 def resolve_command(raw_text):
@@ -2774,11 +2867,21 @@ class SpotlightWindow:
             settings.set_property("gtk-application-prefer-dark-theme", True)
         provider = Gtk.CssProvider()
         provider.load_from_data(CSS_DATA.encode('utf-8'))
+        display = Gdk.Display.get_default()
         Gtk.StyleContext.add_provider_for_display(
-            Gdk.Display.get_default(),
+            display,
             provider,
             Gtk.STYLE_PROVIDER_PRIORITY_USER
         )
+        # Sits above the design glass so the opacity slider can replace it
+        # while blur is off, and clear itself when blur comes back.
+        self._opacity_css = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_display(
+            display,
+            self._opacity_css,
+            Gtk.STYLE_PROVIDER_PRIORITY_USER + 1,
+        )
+        self._apply_glass_opacity()
 
     def create_window(self):
         self.win = Gtk.ApplicationWindow(application=self.app)
@@ -3144,9 +3247,26 @@ class SpotlightWindow:
         display = Gdk.Display.get_default()
         if display is not None:
             self.blur.setup(display)
+        self._blur_probed = True
+        self._apply_glass_opacity()
         # Build the shadow sprite off the first open, so results don't hitch.
         GLib.idle_add(self._warm_shadow)
         return False
+
+    def _opacity_override_active(self):
+        """Custom glass only while blur is off, or the compositor cannot blur."""
+        if not self.settings.get("blur", True):
+            return True
+        if not getattr(self, "_blur_probed", False):
+            return False
+        return not (self.blur.ready and not self.blur.disabled)
+
+    def _apply_glass_opacity(self):
+        css = glass_opacity_css(self.settings["opacity"]) if self._opacity_override_active() else "/* designed glass */\n"
+        try:
+            self._opacity_css.load_from_data(css.encode("utf-8"))
+        except Exception:
+            pass
 
     def _warm_shadow(self):
         try:
@@ -3907,6 +4027,11 @@ class SpotlightWindow:
         if mode == "all" and raw_text.lower().startswith(("fs:", "fs ")):
             GLib.idle_add(self._switch_to_files, raw_text[3:].lstrip())
             return
+        if mode == "all":
+            typed = parse_typed_command(raw_text)
+            if typed is not None:
+                self.render_typed_command(*typed)
+                return
         if raw_text.startswith(":"):
             resolved = resolve_command(raw_text)
             if resolved:
@@ -4109,9 +4234,12 @@ class SpotlightWindow:
         GLib.idle_add(self._ghost_from, raw_text, list(self.results_data))
 
     def _on_blur_toggled(self, switch, _pspec):
-        if not switch.get_sensitive():
+        if not switch.get_sensitive() or getattr(self, "_rebuilding_settings", False):
             return
-        self.settings["blur"] = switch.get_active()
+        active = switch.get_active()
+        if active == bool(self.settings["blur"]):
+            return
+        self.settings["blur"] = active
         save_settings(self.settings)
         self._blur_signature = None
         if self.settings["blur"]:
@@ -4119,6 +4247,29 @@ class SpotlightWindow:
         else:
             self.blur.clear()
             self._blur_signature = None
+        self._apply_glass_opacity()
+        if self.current_filter == "settings":
+            self._rebuilding_settings = True
+            try:
+                self.render_settings()
+            finally:
+                self._rebuilding_settings = False
+
+    def _on_opacity_changed(self, scale):
+        if getattr(self, "_rebuilding_settings", False):
+            return
+        value = int(round(scale.get_value()))
+        value = max(0, min(100, value))
+        if abs(scale.get_value() - value) > 0.01:
+            scale.set_value(value)
+            return
+        if value == self.settings["opacity"]:
+            return
+        self.settings["opacity"] = value
+        if getattr(self, "_opacity_value", None) is not None:
+            self._opacity_value.set_text(f"{value}%")
+        save_settings(self.settings)
+        self._apply_glass_opacity()
 
     def _on_margin_changed(self, scale):
         value = int(round(scale.get_value()))
@@ -4159,7 +4310,7 @@ class SpotlightWindow:
     def render_settings(self):
         blur_ok = self.blur.ready and not self.blur.disabled
         self.set_footer(["Esc close"], "Gear back to search")
-        self.render_results([
+        appearance = [
             {"kind": "header", "title": "Appearance"},
             {
                 "kind": "setting",
@@ -4168,12 +4319,21 @@ class SpotlightWindow:
                 "subtitle": "Frost the wallpaper behind the glass" if blur_ok else "This compositor doesn't blur behind a window",
                 "enabled": blur_ok,
             },
-            {
+        ]
+        if self._opacity_override_active():
+            appearance.append({
                 "kind": "setting",
-                "setting": "margin",
-                "title": "Distance from the top",
-                "subtitle": "Where the bar sits when it opens",
-            },
+                "setting": "opacity",
+                "title": "Opacity",
+                "subtitle": "How solid the bar is while blur is off",
+            })
+        appearance.append({
+            "kind": "setting",
+            "setting": "margin",
+            "title": "Distance from the top",
+            "subtitle": "Where the bar sits when it opens",
+        })
+        self.render_results(appearance + [
             {"kind": "header", "title": "Clipboard"},
             {
                 "kind": "setting",
@@ -4182,6 +4342,58 @@ class SpotlightWindow:
                 "subtitle": "Starred copies stay either way",
             },
         ])
+
+    def render_typed_command(self, prefix, command):
+        """run: runs in the background. term: opens the command in a terminal."""
+        command = command.strip()
+        if command:
+            in_terminal = prefix == "term"
+            item = {
+                "title": f'{prefix}: "{command}"',
+                "subtitle": "Opens in a terminal" if in_terminal else "Runs in the background",
+                "icon": "utilities-terminal",
+                "action": lambda p=prefix, c=command: self._execute_typed(p, c),
+            }
+            self.set_footer(["⏎ run"], "Esc close")
+        else:
+            item = {
+                "title": _TYPED_HINTS[prefix],
+                "subtitle": "Type a command between the quotes, then press Enter",
+                "icon": "utilities-terminal",
+                "action": lambda p=prefix: self._arm_typed_entry(p),
+            }
+            self.set_footer(["Type a command", "⏎ run"], "Esc close")
+        self.render_results([item])
+
+    def _arm_typed_entry(self, prefix):
+        """Put the cursor between the quotes so the command can be typed."""
+        if self.current_filter != "all":
+            self.current_filter = "all"
+            self._mark_mode_buttons()
+            self.badge_box.set_visible(False)
+            self.entry.set_placeholder_text(self.FILTER_META["all"][0])
+            self.results_panel.set_size_request(750, -1)
+        template = f'{prefix}: ""'
+        if self.entry.get_text() != template:
+            self.entry.set_text(template)
+        # prefix + ': "' lands the cursor between the quotes.
+        self.entry.set_position(len(prefix) + 3)
+        self.entry.grab_focus()
+
+    def _execute_typed(self, prefix, command):
+        command = command.strip()
+        if not command:
+            self._arm_typed_entry(prefix)
+            return
+        home = os.path.expanduser("~")
+        self.hide()
+        if prefix == "term":
+            argv = terminal_argv(command, home)
+            if argv is None or spawn_detached(argv, cwd=home) is None:
+                self._notify("Couldn't open a terminal", command)
+            return
+        if spawn_detached(command, shell=True, cwd=home) is None:
+            self._notify("Couldn't run that", command)
 
     def _switch_to_files(self, rest):
         """The old "fs:" prefix now just opens the Files view."""
@@ -4313,6 +4525,12 @@ class SpotlightWindow:
                 "icon": "media-record", "fn": self._toggle_recording,
             })
         actions += [
+            {"id": "run-command", "title": "Run a command",
+             "subtitle": 'run: "then type in command here"',
+             "icon": "utilities-terminal", "fn": lambda: self._arm_typed_entry("run"), "keep_open": True},
+            {"id": "term-command", "title": "Run in a terminal",
+             "subtitle": 'term: "command here"',
+             "icon": "utilities-terminal", "fn": lambda: self._arm_typed_entry("term"), "keep_open": True},
             {"id": "switch-window", "title": "Switch to a window…", "subtitle": "Lists every open window",
              "icon": "preferences-system-windows", "fn": self._open_window_list, "keep_open": True},
             {"id": "lock", "title": "Lock Screen", "subtitle": "Lock the session",
@@ -5047,6 +5265,21 @@ class SpotlightWindow:
                 switch.set_sensitive(item.get("enabled", True))
                 switch.connect("notify::active", self._on_blur_toggled)
                 hbox.append(switch)
+            elif which == "opacity":
+                value = Gtk.Label(label=f"{self.settings['opacity']}%")
+                value.add_css_class("setting-value")
+                value.set_xalign(1)
+                value.set_valign(Gtk.Align.CENTER)
+                self._opacity_value = value
+                scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+                scale.set_draw_value(False)
+                scale.set_can_focus(False)
+                scale.set_valign(Gtk.Align.CENTER)
+                scale.set_size_request(168, -1)
+                scale.set_value(self.settings["opacity"])
+                scale.connect("value-changed", self._on_opacity_changed)
+                hbox.append(scale)
+                hbox.append(value)
             elif which == "margin":
                 value = Gtk.Label(label=f"{self.settings['margin_top']} px")
                 value.add_css_class("setting-value")
@@ -5246,7 +5479,10 @@ class SpotlightWindow:
         else:
             raw = entry.get_text().strip()
             if raw:
-                if self.current_filter == "all" and not raw.lower().startswith(("fs:", "fs ")):
+                typed = parse_typed_command(raw)
+                if typed is not None:
+                    self._execute_typed(*typed)
+                elif self.current_filter == "all" and not raw.lower().startswith(("fs:", "fs ")):
                     self.open_web_search(raw)
             else:
                 self.hide()
